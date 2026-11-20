@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+.pytest_cache/
+output/
+inspection/
+.env
+.env.*
+dist/
+build/
+*.log
+*.dxf
+*.dwg
+*.kml
+*.kmz
+*.report.json
