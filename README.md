@@ -69,6 +69,8 @@ For local/non-georeferenced sheet coordinates, obtain a verified engineering tra
 - Layer selection, local zoom/pan preview, cancellable background processing.
 - One KML/KMZ with CAD layers as folders; entity colors, text labels at insertion points, optional transparent polygon fills.
 - Repeated-plan detection, per-plan selection, map-area clipping, translation onto DXF survey controls, and one Google Earth folder per selected plan.
+- Lease-shaped cropping removes detected legends, title blocks, scale bars, certification tables, and other sheet furniture outside the mapped lease area.
+- Exact repeated geometry is consolidated into one `Shared base map` folder. Combined exports open with one plan visible so overlapping year plans do not obscure the map.
 - Lines, points, closed boundaries, curves approximated with a configurable tolerance, block expansion, hatch boundaries, and other geometry supported by the upstream engine.
 - Ground, absolute, and relative altitude modes, with validation of finite coordinates and longitude/latitude ranges.
 - Exported geometry validity checks, XML roundtrip validation, KMZ archive verification, per-export JSON report, and atomic replacement of each file.

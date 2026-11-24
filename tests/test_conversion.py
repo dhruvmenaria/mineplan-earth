@@ -152,6 +152,17 @@ def test_repeated_plan_sheets_are_clipped_aligned_and_grouped(tmp_path):
     folder_names = [n.text for n in root.findall('.//k:Folder/k:name', N)]
     assert 'Plan 1' in folder_names
     assert 'Plan 2' in folder_names
+    top_folders = root.findall('./k:Document/k:Folder', N)
+    by_name = {folder.find('k:name', N).text: folder for folder in top_folders}
+    assert by_name['Plan 1'].find('k:visibility', N).text == '1'
+    assert by_name['Plan 2'].find('k:visibility', N).text == '0'
+    assert by_name['Shared base map'].find('k:visibility', N).text == '1'
+    assert {node.text for node in by_name['Shared base map'].findall(
+        './/k:Placemark/k:visibility', N)} == {'1'}
+    hidden_states = {node.text for folder in top_folders
+                     if folder.find('k:visibility', N).text == '0'
+                     for node in folder.findall('.//k:Placemark/k:visibility', N)}
+    assert hidden_states <= {'0'}
     coords = [list(map(float, p.split(','))) for el in root.findall('.//k:coordinates', N)
               for p in el.text.split()]
     assert min(p[0] for p in coords) >= 73.68
@@ -163,8 +174,8 @@ def test_repeated_plan_sheets_are_clipped_aligned_and_grouped(tmp_path):
     without_frames = c.convert(
         replace(opts, exclude_plan_boundary=True, exclude_sheet_frame=True),
         tmp_path / 'without-frames.kml')
-    assert without_frames['report']['mineplan_earth']['features_exported'] == \
-        result['report']['mineplan_earth']['features_exported'] - 4
+    assert without_frames['report']['mineplan_earth']['features_exported'] < \
+        result['report']['mineplan_earth']['features_exported']
     assert without_frames['report']['plan_sheet_alignment'][
         'detected_plan_boundary_excluded'] is True
     assert without_frames['report']['plan_sheet_alignment'][

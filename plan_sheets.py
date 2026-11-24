@@ -464,8 +464,8 @@ def detect(path, *, margin=25.0):
 def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
                   include_plan_boundary=True, include_sheet_frame=True):
     """Clip every selected panel to its map area and translate it onto survey controls."""
-    from shapely import affinity, force_2d, make_valid
-    from shapely.geometry import box
+    from shapely import affinity, force_2d, make_valid, normalize, set_precision
+    from shapely.geometry import Polygon, box
     from shapely.ops import unary_union
 
     chosen = {str(value) for value in selected_ids}
@@ -477,16 +477,22 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
     for plan in plans:
         plan_start = len(aligned)
         boundary = plan["boundary"]
-        xmin = min(p[0] for p in boundary) - margin
-        ymin = min(p[1] for p in boundary) - margin
-        xmax = max(p[0] for p in boundary) + margin
-        ymax = max(p[1] for p in boundary) + margin
-        crop = box(xmin, ymin, xmax, ymax)
+        # A rectangular crop includes the title block, legend and certification
+        # table that often sit inside the boundary's bounding rectangle.  The
+        # actual repeated lease outline is the reliable map-area evidence.
+        crop = Polygon(boundary)
+        if not crop.is_valid:
+            crop = make_valid(crop)
+        crop = crop.buffer(margin, join_style="mitre")
+        furniture_mask, furniture_handles = _sheet_furniture_mask(
+            records, Polygon(boundary), crop, box)
         for source in records:
             if cancel:
                 cancel.check()
             if not include_plan_boundary and str(source.get("entity_handle", "")) == \
                     str(plan.get("boundary_handle", "")):
+                continue
+            if str(source.get("entity_handle", "")) in furniture_handles:
                 continue
             geometry = source.get("geometry")
             if geometry is None or geometry.is_empty:
@@ -497,6 +503,8 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
             if not geometry.intersects(crop):
                 continue
             clipped = geometry.intersection(crop)
+            if furniture_mask is not None and not clipped.is_empty:
+                clipped = clipped.difference(furniture_mask)
             if clipped.is_empty:
                 continue
             if not clipped.is_valid:
@@ -520,7 +528,13 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
             record["geometry"] = moved
             # The source contains exact duplicate outlines.  Remove only exact,
             # same-layer duplicates after clipping/alignment.
-            key = (plan["id"], original_layer, str(record.get("entity_type")), moved.wkb)
+            # AutoCAD frequently stores the same visible object more than once
+            # using reversed vertex order or a second line/polyline entity.
+            # Canonicalise at 1 mm in drawing coordinates, while retaining the
+            # original CAD layer and label so distinct meanings are preserved.
+            canonical = normalize(set_precision(force_2d(moved), 0.001))
+            text = str(record.get("text_value") or "").strip().casefold()
+            key = (plan["id"], original_layer.casefold(), text, canonical.wkb)
             if key not in seen:
                 seen.add(key)
                 aligned.append(record)
@@ -556,7 +570,98 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
                     if index not in remove]
     if not aligned:
         raise ValueError("No geometry was found inside the selected plan map areas.")
+    aligned = _consolidate_shared_features(aligned, plans)
     return _place_shared_outer_boundary_with_environment(aligned, plans)
+
+
+def _is_sheet_furniture_text(value):
+    """Identify labels that belong to a plan sheet rather than map evidence."""
+    text = re.sub(r"\s+", " ", str(value or "").replace("\\P", " ")).strip().upper()
+    return bool(
+        text in {"INDEX", "LEGEND", "MTS."}
+        or "CERTIFIED THAT THIS PLAN" in text
+        or "QUALIFIED PERSON" in text
+        or "PLATE NO" in text
+        or ("SCALE" in text and ("R.F." in text or "CM" in text))
+        or ("LESSEE" in text and ("DISTT" in text or "TEH" in text))
+        or ("PLAN" in text and "M.L.NO" in text)
+    )
+
+
+def _sheet_furniture_mask(records, lease, crop, box_factory):
+    """Return outside-lease sheet regions associated with title/legend labels."""
+    from shapely.ops import unary_union
+
+    if not lease.is_valid:
+        from shapely import make_valid
+        lease = make_valid(lease)
+    xmin, ymin, xmax, ymax = crop.bounds
+    cx, cy = lease.centroid.x, lease.centroid.y
+    safe_map = lease.buffer(2.0, join_style="mitre")
+    regions = []
+    handles = set()
+    for record in records:
+        if not _is_sheet_furniture_text(record.get("text_value")):
+            continue
+        geometry = record.get("geometry")
+        if geometry is None or geometry.is_empty or not geometry.intersects(crop):
+            continue
+        handles.add(str(record.get("entity_handle", "")))
+        point = geometry.representative_point()
+        if safe_map.covers(point):
+            continue
+        dx, dy = point.x - cx, point.y - cy
+        if abs(dx) >= abs(dy):
+            region = box_factory(point.x - 5, ymin, xmax, ymax) if dx >= 0 \
+                else box_factory(xmin, ymin, point.x + 5, ymax)
+        else:
+            region = box_factory(xmin, point.y - 5, xmax, ymax) if dy >= 0 \
+                else box_factory(xmin, ymin, xmax, point.y + 5)
+        regions.append(region.difference(safe_map))
+    if not regions:
+        return None, handles
+    return unary_union(regions), handles
+
+
+def _consolidate_shared_features(records, plans):
+    """Keep geometrically identical base-map features once across plan panels.
+
+    Repeated plan sheets copy contours, roads, lease pillars and annotations into
+    every panel.  After alignment those copies stack in Google Earth.  Identical
+    objects from the same original CAD layer are placed in one Shared base map
+    folder.  A feature appearing in just one plan stays with that plan.
+    """
+    from collections import defaultdict
+    from shapely import force_2d, normalize, set_precision
+
+    if len(plans) < 2:
+        return records
+    groups = defaultdict(list)
+    for index, record in enumerate(records):
+        geometry = record.get("geometry")
+        if geometry is None or geometry.is_empty:
+            continue
+        original_layer = str(record.get("cad_layer") or "0").split(" / ", 1)[-1]
+        text = str(record.get("text_value") or "").strip().casefold()
+        canonical = normalize(set_precision(force_2d(geometry), 0.001))
+        groups[(original_layer.casefold(), text, canonical.wkb)].append(index)
+
+    removed = set()
+    shared = []
+    for indexes in groups.values():
+        plan_ids = {str(records[index].get("plan_id") or "") for index in indexes}
+        if len(plan_ids) < 2:
+            continue
+        preferred = min(indexes)
+        record = dict(records[preferred])
+        original_layer = str(record.get("cad_layer") or "0").split(" / ", 1)[-1]
+        record["cad_layer"] = f"Shared base map / {original_layer}"
+        record["plan_id"] = "shared-base-map"
+        record["plan_title"] = "Shared base map"
+        record["shared_plan_count"] = len(plan_ids)
+        shared.append(record)
+        removed.update(indexes)
+    return [record for index, record in enumerate(records) if index not in removed] + shared
 
 
 def _place_shared_outer_boundary_with_environment(records, plans):

@@ -14,6 +14,7 @@ from pathlib import Path
 
 import converter
 import large_dxf
+from verify_dialog import VerifyPanel
 from vendor import cad_to_gis as cad
 
 HERE = Path(__file__).resolve().parent
@@ -317,6 +318,8 @@ class App(tk.Tk):
         self.tabs.add(report_tab, text="Export report")
         self.report_text = self._text_box(report_tab)
         self._set_text(self.report_text, "Your export summary will appear here.\n\nEvery KML/KMZ export includes a JSON report next to the output file.\n\nObjects that cannot be represented are reported. Verify important boundary points against trusted survey coordinates.")
+        self.verify_panel = VerifyPanel(self.tabs, self)
+        self.tabs.add(self.verify_panel, text="Verify export")
         log_tab = ttk.Frame(self.tabs)
         self.tabs.add(log_tab, text="Activity")
         self.log_text = self._text_box(log_tab)
@@ -400,6 +403,7 @@ class App(tk.Tk):
 
     def _load_path(self, path):
         self.file.set(str(path))
+        self.verify_panel.set_candidate("")
         self.large_index = None
         self.large_source = None
         self.scanned_path = None
@@ -844,6 +848,7 @@ class App(tk.Tk):
         def done(result):
             self.last_output = result["output"]
             self.open_button.configure(state="normal")
+            self.verify_panel.set_candidate(result["output"])
             self._set_text(self.report_text, self._summary(result))
             self.tabs.select(1)
             info = result["report"]["mineplan_earth"]
@@ -999,6 +1004,7 @@ class App(tk.Tk):
 
     def _run(self, operation, done):
         self.busy = True
+        self.verify_panel.set_busy(True)
         self.token = cad.CancellationToken()
         self.progressbar["value"] = 0
         for button in [self.browse_button, self.scan_button, self.demo_button,
@@ -1021,6 +1027,7 @@ class App(tk.Tk):
 
     def _finish(self):
         self.busy = False
+        self.verify_panel.set_busy(False)
         for button in [self.browse_button, self.scan_button, self.demo_button,
                        self.preview_button, self.export_button]:
             button.configure(state="normal")

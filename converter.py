@@ -21,7 +21,7 @@ import semantic_layers
 
 NS = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", NS)
-APP_VERSION = "0.9.2"
+APP_VERSION = "0.9.3"
 APP_AUTHOR = "Dhruv Menaria"
 
 
@@ -166,11 +166,16 @@ def make_kml(output_layers, options, report, cancel=None):
     doc = el(root, "Document")
     el(doc, "name", options.document_name.strip() or Path(options.input_path).stem)
     el(doc, "description", f"Converted by MinePlan Earth | {APP_AUTHOR}. Verify survey control points before use.")
-    folders, plan_folders, styles = {}, {}, {}
-    for plan in report.get("plan_sheet_alignment", {}).get("selected_plans", []):
+    folders, folder_visibility, plan_folders, styles = {}, {}, {}, {}
+    selected_plans = report.get("plan_sheet_alignment", {}).get("selected_plans", [])
+    first_plan_name = str(selected_plans[0]["title"]) if selected_plans else None
+    for plan_index, plan in enumerate(selected_plans):
         plan_name = str(plan["title"])
         plan_folders[plan_name] = el(doc, "Folder")
         el(plan_folders[plan_name], "name", plan_name)
+        # A combined file becomes unreadable when every year is drawn at once.
+        # Keep all folders available, with only the first plan initially visible.
+        el(plan_folders[plan_name], "visibility", "1" if plan_index == 0 else "0")
         el(plan_folders[plan_name], "open", "0")
     counts, missing_heights, repaired_for_kml = Counter(), 0, 0
     bounds = [math.inf, math.inf, -math.inf, -math.inf]
@@ -203,10 +208,22 @@ def make_kml(output_layers, options, report, cancel=None):
                     if plan_name not in plan_folders:
                         plan_folders[plan_name] = el(doc, "Folder")
                         el(plan_folders[plan_name], "name", plan_name)
+                        el(plan_folders[plan_name], "visibility", "1")
                         el(plan_folders[plan_name], "open", "0")
                     parent = plan_folders[plan_name]
                 folders[layer] = el(parent, "Folder")
                 el(folders[layer], "name", folder_name)
+                visible = "1"
+                if " / " in layer:
+                    plan_name = layer.split(" / ", 1)[0]
+                    visible = "1" if (first_plan_name is None or
+                                      plan_name in {first_plan_name, "Shared base map"}) else "0"
+                folder_visibility[layer] = visible
+                # Google Earth Pro derives checkbox state from descendants as well
+                # as the parent folder.  Carry the initial plan state down to the
+                # layer folder and each Placemark so hidden years stay hidden on
+                # first import instead of all plans appearing stacked together.
+                el(folders[layer], "visibility", visible)
                 el(folders[layer], "open", "0")
             color = str(row.get("color_hex") or "#66B5FF")
             raw_weight = row.get("lineweight")
@@ -235,6 +252,7 @@ def make_kml(output_layers, options, report, cancel=None):
             if not name or not isinstance(name, str):
                 name = f"{row.get('entity_type', 'Feature')} {row.get('entity_handle', '')}"
             el(pm, "name", name)
+            el(pm, "visibility", folder_visibility[layer])
             el(pm, "description", f"Layer: {layer}\nEntity: {row.get('entity_type')}\nSource: {Path(options.input_path).name}")
             el(pm, "styleUrl", "#" + styles[key])
             ext = el(pm, "ExtendedData")
@@ -273,6 +291,8 @@ def make_kml(output_layers, options, report, cancel=None):
         "height_reference_confirmed_by_user": options.heights_confirmed,
         "invalid_plan_geometries_repaired_for_kml": repaired_for_kml,
         "notes": ["Detected plan sheets are clipped and aligned only when Plan mode is enabled.",
+                  "Plan mode removes detected sheet furniture and consolidates identical shared map features.",
+                  "Combined multi-plan files initially show one plan plus the shared base map.",
                   "Height values are not converted between vertical datums.",
                   "Text is exported at its insertion point; CAD typography and hatch patterns are not reproduced.",
                   "Curve tolerance is measured in source drawing units."]}
