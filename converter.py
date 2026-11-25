@@ -14,7 +14,7 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 from pyproj import CRS, Geod, Transformer
 from shapely.geometry import Polygon, MultiPolygon
-from shapely import make_valid
+from shapely import affinity, make_valid
 
 from vendor import cad_to_gis as cad
 import plan_sheets
@@ -23,7 +23,7 @@ import semantic_layers
 
 NS = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", NS)
-APP_VERSION = "0.12.0"
+APP_VERSION = "0.13.0"
 APP_AUTHOR = "Dhruv Menaria"
 WGS84_GEOD = Geod(ellps="WGS84")
 
@@ -55,6 +55,7 @@ class Options:
     semantic_dominant_style_hints: tuple = ()
     semantic_categories: tuple[str, ...] = ()
     coordinate_control_json: str = ""
+    government_clean_preset: bool = False
 
 
 def el(parent, tag, text=None, **attributes):
@@ -555,6 +556,28 @@ def _atomic_bytes(path, data):
             os.unlink(temporary)
 
 
+def _aligned_detected_lease_boundaries(plan_detection, selected_ids):
+    """Return plan-title lease polygons in the same aligned source space as records."""
+    if not plan_detection:
+        return {}
+    selected = {str(value) for value in (selected_ids or ())}
+    result = {}
+    first = None
+    for plan in plan_detection.get("plans", ()):
+        if selected and str(plan.get("id")) not in selected:
+            continue
+        points = plan.get("boundary") or ()
+        matrix = plan.get("affine")
+        if len(points) < 3 or not matrix or len(matrix) != 6:
+            continue
+        polygon = affinity.affine_transform(Polygon(points), matrix)
+        result[str(plan.get("title") or plan.get("id"))] = polygon
+        first = first or polygon
+    if first is not None:
+        result.setdefault("Shared base map", first)
+    return result
+
+
 def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=lambda *_: None):
     output = Path(output_path).expanduser().resolve()
     if output.suffix.lower() not in {".kml", ".kmz"}:
@@ -643,6 +666,35 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
                     review_rules.rule_path(options.input_path))
             else:
                 log("No recognised AutoCAD legend was found; preserving original CAD layer folders.")
+        mining_audit = None
+        clean_preset_report = None
+        if semantic_summary is not None:
+            source_crs = CRS.from_user_input(options.source_crs)
+            metre_units = bool(source_crs.is_projected and source_crs.axis_info and all(
+                abs(float(axis.unit_conversion_factor or 1.0) - 1.0) <= 1e-9
+                for axis in source_crs.axis_info))
+            mining_audit = semantic_layers.mining_geometry_audit(
+                records, metre_units=metre_units,
+                lease_boundaries=_aligned_detected_lease_boundaries(
+                    plan_detection, options.plan_ids))
+            if mining_audit["status"] != "pass":
+                quality.add_issue(
+                    "warning", "mining_geometry_review",
+                    "Mining geometry QA found items requiring review; see mining_geometry_audit in the report.")
+        if options.government_clean_preset and semantic_summary is not None:
+            before = len(records)
+            decorative_categories = {"CONTOUR", "GRID LINE", "SECTION LINE"}
+            records = [record for record in records
+                       if record.get("semantic_category") not in decorative_categories
+                       and not (str(record.get("entity_type") or "").upper() == "HATCH"
+                               and record.get("semantic_category") == "UNCLASSIFIED - REVIEW")]
+            clean_preset_report = {
+                "enabled": True,
+                "policy": "Remove contours, grids, section lines and unclassified decorative hatches from government KMZ members.",
+                "records_before": before,
+                "records_after": len(records),
+                "records_removed": before - len(records),
+            }
         roundtrip = _coordinate_roundtrip(records, options)
         if roundtrip.get("status") == "review":
             quality.add_issue(
@@ -671,6 +723,10 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
             report["coordinate_control"] = coordinate_control
         if semantic_summary is not None:
             report["semantic_classification"] = semantic_summary
+        if mining_audit is not None:
+            report["mining_geometry_audit"] = mining_audit
+        if clean_preset_report is not None:
+            report["government_clean_preset"] = clean_preset_report
         if legend_report is not None:
             report["source_legend"] = legend_report
         if plan_detection is not None:
@@ -879,7 +935,8 @@ def convert_submission(options, parent_directory, *, cancel=None,
             semantic_folders=True, semantic_style_hints=style_hints,
             semantic_plan_style_hints=plan_style_hints,
             semantic_dominant_style_hints=dominant_style_hints,
-            semantic_categories=legend_categories)
+            semantic_categories=legend_categories,
+            government_clean_preset=True)
 
         def group_progress(value, status, i=index):
             progress(0.10 + 0.90 * (i + max(0.0, min(1.0, value))) / len(groups), status)
@@ -902,6 +959,8 @@ def convert_submission(options, parent_directory, *, cancel=None,
             "qa_report": str(report_target),
             "status": result["report"]["status"],
             "semantic_classification": result["report"].get("semantic_classification", {}),
+            "mining_geometry_audit": result["report"].get("mining_geometry_audit", {}),
+            "government_clean_preset": result["report"].get("government_clean_preset", {}),
         })
 
     produced = {item["filename"] for item in files}
@@ -920,6 +979,13 @@ def convert_submission(options, parent_directory, *, cancel=None,
     if unclassified:
         warnings.append(
             f"{unclassified} of {classified_total} records remain in UNCLASSIFIED folders; review before submission.")
+    audit_errors = sum(item.get("mining_geometry_audit", {}).get("counts", {}).get("error", 0)
+                       for item in files)
+    audit_reviews = sum(item.get("mining_geometry_audit", {}).get("counts", {}).get("review", 0)
+                        for item in files)
+    if audit_errors or audit_reviews:
+        warnings.append(
+            f"Mining geometry QA reported {audit_errors} error(s) and {audit_reviews} review item(s); inspect the QA reports.")
     summary = {
         "application": "MinePlan Earth",
         "application_version": APP_VERSION,
@@ -940,6 +1006,8 @@ def convert_submission(options, parent_directory, *, cancel=None,
         "unclassified_records": unclassified,
         "learned_semantic_style_rules": len(style_hints),
         "source_legend": legend_report,
+        "government_clean_preset": True,
+        "mining_geometry_issue_counts": {"error": audit_errors, "review": audit_reviews},
     }
     manifest = qa_folder / "submission-manifest.json"
     checklist = qa_folder / "REVIEW BEFORE SUBMISSION.txt"

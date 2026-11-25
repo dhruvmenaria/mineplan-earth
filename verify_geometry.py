@@ -6,9 +6,10 @@ from pathlib import Path
 import xml.etree.ElementTree as ET
 import zipfile
 
-from pyproj import Geod
+from pyproj import Geod, Transformer
 from shapely import get_coordinates, normalize
 from shapely.geometry import Point, LineString, Polygon, GeometryCollection
+from shapely.ops import transform
 
 
 KML = "http://www.opengis.net/kml/2.2"
@@ -175,14 +176,42 @@ def _distance(a, b):
     return float(max(distances))
 
 
+def _shape_distance(a, b):
+    """Return Hausdorff distance and polygon overlap after local metre projection."""
+    if a is None or b is None or a.is_empty or b.is_empty:
+        return None, None
+    centre = a.union(b).centroid
+    zone = max(1, min(60, int((centre.x + 180) // 6) + 1))
+    epsg = (32600 if centre.y >= 0 else 32700) + zone
+    projector = Transformer.from_crs(4326, epsg, always_xy=True).transform
+    projected_a, projected_b = transform(projector, a), transform(projector, b)
+    distance = float(projected_a.hausdorff_distance(projected_b))
+    overlap = None
+    if projected_a.geom_type in {"Polygon", "MultiPolygon"} and \
+            projected_b.geom_type in {"Polygon", "MultiPolygon"}:
+        union_area = float(projected_a.union(projected_b).area)
+        overlap = (100.0 * float(projected_a.intersection(projected_b).area) / union_area
+                   if union_area else 100.0)
+    return distance, overlap
+
+
 def _assess(a, b, tolerance):
     if a.reason or b.reason:
         return "review", a.reason or b.reason, None
     distance = _distance(a.geometry, b.geometry)
-    if distance is None:
-        return "changed", "Geometry type, component structure or vertex count differs.", None
-    if distance > tolerance:
-        return "changed", f"Corresponding vertices differ by up to {distance:.3f} m.", distance
+    overlap = None
+    if distance is None or distance > tolerance:
+        hausdorff, overlap = _shape_distance(a.geometry, b.geometry)
+        if hausdorff is None or hausdorff > tolerance:
+            detail = ("Geometry type, component structure or vertex count differs."
+                      if distance is None else
+                      f"Corresponding vertices differ by up to {distance:.3f} m.")
+            if hausdorff is not None:
+                detail += f" Shape/Hausdorff difference is {hausdorff:.3f} m."
+                if overlap is not None:
+                    detail += f" Polygon overlap is {overlap:.2f}%."
+            return "changed", detail, hausdorff if hausdorff is not None else distance
+        distance = hausdorff
     if a.name != b.name or a.folder != b.folder:
         return "changed", f"Expected {' / '.join((*a.folder, a.name))}; found {' / '.join((*b.folder, b.name))}.", distance
     absent = []
@@ -193,7 +222,11 @@ def _assess(a, b, tolerance):
             return "changed", f"{key}: expected {a.fields.get(key)!r}, found {b.fields.get(key)!r}.", distance
     if absent:
         return "review", "Geometry agrees; missing CAD metadata: " + ", ".join(absent), distance
-    return "matched", "Horizontal vertices, name, folder and available CAD identifiers agree.", distance
+    method = "shape/Hausdorff" if _structure(a.geometry) != _structure(b.geometry) else "corresponding vertices"
+    detail = f"Horizontal geometry agrees by {method}; name, folder and available CAD identifiers agree."
+    if overlap is not None:
+        detail += f" Polygon overlap is {overlap:.2f}%."
+    return "matched", detail, distance
 
 
 def compare_kml(expected: bytes, actual: Path, tolerance_m: float, cancel=None):

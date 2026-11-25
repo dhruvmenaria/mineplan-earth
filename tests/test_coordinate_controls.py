@@ -35,6 +35,8 @@ def test_parse_decimal_and_dms_controls():
     assert points[0].latitude == pytest.approx(26 + 44 / 60 + 56.2 / 3600)
     assert points[0].longitude == pytest.approx(75 + 13 / 60 + 37.99 / 3600)
     assert points[0].precision_metres == pytest.approx(0.3092)
+    damaged, _ = coordinate_controls.parse_angle('N26Â°44\'56.20"', "latitude")
+    assert damaged == pytest.approx(26 + 44 / 60 + 56.2 / 3600)
 
 
 def test_similarity_fit_recovers_known_transformation():

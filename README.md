@@ -2,12 +2,13 @@
 
 **Dhruv Menaria**
 
-Version 0.12.0 adds named-block, connected-symbol, repeated-geometry and
-constrained nearby-label classification alongside the Coordinate Control Wizard
-and interactive review. The wizard fits matched CAD X/Y and authoritative survey
-latitude/longitude controls, reports every residual and an optional independent
-holdout check, and blocks failed or stale calibrations. Uncertain drawing
-objects can then be reviewed and assigned safely to semantic folders.
+Version 0.13.0 adds mining-specific geometry QA, a clean government-package
+preset and cross-tool shape verification. MinePlan Earth now reports lease area,
+pit/dump containment, boundary-pillar offsets and approximate 7.5 m, 60 m and
+500 m boundary distances. Government KMZ members omit decorative contours,
+grids, section lines and unclassified hatches while the normal full export stays
+unchanged. Verification can compare equivalent geometry by Hausdorff distance
+even when another tool writes a different number of vertices.
 
 Local Windows desktop converter for DXF/DWG drawing outlines to Google Earth KML/KMZ.
 Built on the MIT-licensed CAD extraction engine from [CAD to GIS Studio](https://github.com/ricbencar/cad-to-gis-convert).
@@ -77,6 +78,30 @@ The full control table and transformation are embedded in every export report.
 
 Google Maps and satellite imagery are visual references only. They are not
 survey controls and no Google Maps API key is used to calculate coordinates.
+
+## Mining geometry QA
+
+When a drawing legend identifies a closed lease boundary, the export report
+contains a `mining_geometry_audit` section. It records calculated lease area in
+hectares and conservatively checks classified pits, dumps, topsoil, backfill and
+reclaimed areas against the lease. Boundary pillars farther than 2 m from the
+lease and statutory/environment boundaries whose sampled median distance does
+not resemble 7.5 m, 60 m or 500 m are flagged for review. These are software QA
+checks, not survey or regulatory certification.
+
+The government submission folder enables a clean-review preset. It removes
+classified contour, grid and section-line furniture and unclassified decorative
+hatches from those KMZ members only. The source drawing and ordinary full KMZ
+export are not altered. Confirm the required contents with the responsible
+qualified person because scrutiny requirements can vary by authority and case.
+
+## Cross-tool verification
+
+The verifier first checks corresponding WGS 84 vertices. If component structure
+or vertex density differs, it projects both features into the local UTM zone and
+uses Hausdorff distance; polygon comparisons also report overlap percentage.
+This permits comparison with geometrically equivalent KML from other tools while
+still flagging actual boundary displacement.
 
 ## Large DXF Mode
 

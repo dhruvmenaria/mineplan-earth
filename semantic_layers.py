@@ -26,9 +26,16 @@ CATEGORY_RULES = (
     ("7.5M. STATUTORY BARRIER", (r"\b7\s*5\s*M\b.*\b(?:BARRIER|STATUTORY)",
                                   r"\bSTATUTORY BARRIER\b")),
     ("ULTIMATE PIT LIMIT", (r"\bULTIMATE PIT LIMIT\b",)),
+    ("PROP. PIT", (r"\bPROP(?:OSED)?\b.*\b(?:PIT|QUARRY)\b",
+                    r"\b(?:PIT|QUARRY)\b.*\bPROP(?:OSED)?\b")),
     ("PROP. YEAR WISE WORKING", (r"\bPROP(?:OSED)?\b.*\bYEAR\b.*\bWORK", 
                                   r"\bYEAR WISE (?:PIT|WORK)")),
     ("PROP. MINERAL REJECT DUMP", (r"\bMINERAL REJECT DUMP\b", r"\bMRL\b.*\bDUMP\b")),
+    ("PROP. OVERBURDEN / WASTE DUMP", (
+        r"\bPROP(?:OSED)?\b.*\b(?:OVER\s*BURDEN|OB|WASTE)\b.*\bDUMP\b",
+        r"\b(?:OVER\s*BURDEN|OB|WASTE)\b.*\bDUMP\b.*\bPROP(?:OSED)?\b")),
+    ("PROP. TOPSOIL STACK", (r"\bPROP(?:OSED)?\b.*\bTOP\s*SOIL\b",
+                              r"\bTOP\s*SOIL\b.*\b(?:STACK|DUMP|YARD)\b")),
     ("PROP. MINERAL STACK YARD", (r"\bMINERAL (?:STACK|STOCK) YARD\b",)),
     ("PROP. BACKFILL DUMP", (r"\bBACKFILL DUMP\b",)),
     ("PROP. RETAINING WALL", (r"\bRETAINING WALL\b",)),
@@ -42,8 +49,14 @@ CATEGORY_RULES = (
     ("PROP. OFFICE", (r"\bPROP(?:OSED)?\b.*\bOFFICE\b", r"\bSTORE ROOM\b.*\bOFFICE\b")),
     ("PROP. HAULAGE ROAD", (r"\bHAULAGE ROAD\b",)),
     ("EXIST. ROAD", (r"\bEXIST(?:ING)?\b.*\bROAD\b", r"\bROAD\s*/?\s*RASTA\b")),
+    ("EXIST. OVERBURDEN / WASTE DUMP", (
+        r"\bEXIST(?:ING)?\b.*\b(?:OVER\s*BURDEN|OB|WASTE)\b.*\bDUMP\b",)),
+    ("EXIST. TOPSOIL STACK", (r"\bEXIST(?:ING)?\b.*\bTOP\s*SOIL\b",)),
     ("EXIST. DUMP", (r"\bEXIST(?:ING)?\b.*\bDUMP\b",)),
-    ("EXIST. PIT", (r"\bEXIST(?:ING)?\b.*\bPIT\b", r"\bPIT\s*[- ]?\d+\b", r"\bQUARRY\b")),
+    ("BACKFILLED AREA", (r"\bBACK\s*FILL(?:ED)?\b.*\bAREA\b",)),
+    ("RECLAIMED AREA", (r"\bRECLAIM(?:ED|ATION)?\b.*\bAREA\b",)),
+    ("VIRGIN AREA", (r"\bVIRGIN\b.*\bAREA\b",)),
+    ("EXIST. PIT", (r"\bEXIST(?:ING)?\b.*\b(?:PIT|QUARRY)\b", r"\bPIT\s*[- ]?\d+\b")),
     ("EXIST. WELL", (r"\bEXIST(?:ING)?\b.*\bWELL\b", r"\bWELL\b")),
     ("EXIST. SCREENING", (r"\bEXIST(?:ING)?\b.*\bSC+RE+N+ING\b",)),
     ("SURVEY STATION", (r"\bSURVEY STATION\b",)),
@@ -154,6 +167,142 @@ def style_signature(record):
 
 def available_categories():
     return sorted({category for category, _ in CATEGORY_RULES})
+
+
+def mining_geometry_audit(records, *, metre_units=True, lease_boundaries=None):
+    """Run conservative, report-only mining geometry checks.
+
+    The audit never changes geometry or classifications. Distance and area
+    checks are only meaningful when source coordinates are projected metres.
+    """
+    from shapely.geometry import Point
+    from shapely.ops import unary_union
+
+    issues = []
+    lease_boundaries = dict(lease_boundaries or {})
+    plans = defaultdict(list)
+    for record in records:
+        plans[str(record.get("plan_title") or record.get("plan_id") or "Drawing")].append(record)
+
+    def add(severity, code, plan, message, **details):
+        issues.append({"severity": severity, "code": code, "plan": plan,
+                       "message": message, **details})
+
+    def polygonal(geometry):
+        return geometry is not None and not geometry.is_empty and \
+            geometry.geom_type in {"Polygon", "MultiPolygon"}
+
+    def boundary_distance_samples(geometry, lease_boundary):
+        from shapely import get_coordinates
+        target = geometry.boundary if polygonal(geometry) else geometry
+        if target is None or target.is_empty:
+            return []
+        coordinates = list(get_coordinates(target))
+        if not coordinates:
+            return []
+        step = max(1, len(coordinates) // 100)
+        return sorted(Point(xy[:2]).distance(lease_boundary)
+                      for xy in coordinates[::step])
+
+    checked_features = 0
+    lease_areas = []
+    for plan, members in plans.items():
+        leases = [record["geometry"] for record in members
+                  if record.get("semantic_category") == "LEASE BOUNDARY"
+                  and polygonal(record.get("geometry"))]
+        fallback = lease_boundaries.get(plan)
+        if not leases and polygonal(fallback):
+            leases = [fallback]
+        if not leases:
+            add("review", "lease_boundary_missing", plan,
+                "No closed LEASE BOUNDARY polygon was available for geometric QA.")
+            continue
+        lease = unary_union(leases)
+        if lease.is_empty:
+            add("error", "lease_boundary_empty", plan,
+                "The classified lease boundary is empty.")
+            continue
+        if not lease.is_valid:
+            add("error", "lease_boundary_invalid", plan,
+                "The classified lease boundary has invalid polygon topology.")
+        if metre_units:
+            area_ha = float(lease.area) / 10_000.0
+            lease_areas.append({"plan": plan, "area_hectares": area_ha})
+        else:
+            add("review", "non_metre_geometry", plan,
+                "Containment is checked, but area and statutory distances were skipped because the CRS is not projected metres.")
+
+        controlled_areas = {
+            "EXIST. PIT", "PROP. PIT", "EXIST. DUMP",
+            "PROP. MINERAL REJECT DUMP", "PROP. OVERBURDEN / WASTE DUMP",
+            "EXIST. OVERBURDEN / WASTE DUMP", "PROP. TOPSOIL STACK",
+            "EXIST. TOPSOIL STACK", "BACKFILLED AREA", "RECLAIMED AREA",
+        }
+        containment_scope = "ENVIRONMENT" not in _normalise(plan) and \
+            "SHARED BASE" not in _normalise(plan)
+        for record in members:
+            category = record.get("semantic_category")
+            geometry = record.get("geometry")
+            if not containment_scope or category not in controlled_areas or not polygonal(geometry):
+                continue
+            checked_features += 1
+            outside = geometry.difference(lease.buffer(0.5 if metre_units else 0.0))
+            if not outside.is_empty:
+                ratio = (float(outside.area) / float(geometry.area) * 100.0
+                         if polygonal(geometry) and geometry.area else None)
+                add("error", "feature_outside_lease", plan,
+                    f"{category} contains geometry outside the lease boundary.",
+                    category=category, entity_handle=record.get("entity_handle"),
+                    outside_percent=ratio)
+
+        for record in members:
+            if record.get("semantic_category") != "Boundary pillars":
+                continue
+            geometry = record.get("geometry")
+            if geometry is None or geometry.is_empty:
+                continue
+            distance = geometry.representative_point().distance(lease.boundary)
+            if metre_units and distance > 2.0:
+                add("review", "pillar_off_boundary", plan,
+                    f"A boundary pillar is {distance:.2f} m from the lease boundary.",
+                    entity_handle=record.get("entity_handle"), distance_metres=distance)
+
+        expected_distances = {
+            "7.5M. STATUTORY BARRIER": 7.5,
+            "60 M. BOUNDARY": 60.0,
+            "500 M. BOUNDARY": 500.0,
+        }
+        if metre_units:
+            for record in members:
+                category = record.get("semantic_category")
+                if category not in expected_distances:
+                    continue
+                geometry = record.get("geometry")
+                if geometry is None or geometry.is_empty or geometry.geom_type in {"Point", "MultiPoint"}:
+                    continue
+                distances = boundary_distance_samples(geometry, lease.boundary)
+                if not distances:
+                    continue
+                measured = distances[len(distances) // 2]
+                expected = expected_distances[category]
+                tolerance = max(1.5, expected * 0.10)
+                if abs(measured - expected) > tolerance:
+                    add("review", "buffer_distance_mismatch", plan,
+                        f"{category} is approximately {measured:.2f} m from the lease boundary; expected about {expected:g} m.",
+                        category=category, measured_metres=measured,
+                        expected_metres=expected, tolerance_metres=tolerance)
+
+    counts = Counter(issue["severity"] for issue in issues)
+    return {
+        "status": "fail" if counts["error"] else "review" if counts["review"] else "pass",
+        "metre_units": bool(metre_units),
+        "plans_checked": len(plans),
+        "controlled_features_checked": checked_features,
+        "lease_areas": lease_areas,
+        "counts": dict(counts),
+        "issues": issues,
+        "review_required": True,
+    }
 
 
 def _raw_entity_style(entity, doc):

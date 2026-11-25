@@ -33,7 +33,8 @@ def parse_angle(value, kind):
     kind = str(kind).lower()
     if kind not in {"latitude", "longitude"}:
         raise ValueError("Coordinate kind must be latitude or longitude.")
-    text = str(value).strip().upper().replace("º", "°").replace("�", "°")
+    text = (str(value).strip().upper().replace("Â°", "°")
+            .replace("º", "°").replace("�", "°"))
     if not text:
         raise ValueError(f"Missing {kind}.")
     hemisphere = next((letter for letter in text if letter in "NSEW"), "")
@@ -246,6 +247,7 @@ def solve(points, target_crs=None, holdout_index=None):
         status = "fail"
     precision_metres = max((point.precision_metres or 0.0) for point in points) or None
     quality_notes = []
+    plausibility_warnings = []
     if len(training) < 3 and holdout_index is None and status == "pass":
         status = "review"
         quality_notes.append(
@@ -254,6 +256,26 @@ def solve(points, target_crs=None, holdout_index=None):
         status = "review"
         quality_notes.append(
             "The written coordinate precision is coarser than the strict one-metre pass limit.")
+    mean_latitude = sum(point.latitude for point in points) / len(points)
+    mean_longitude = sum(point.longitude for point in points) / len(points)
+    if 68 <= mean_latitude <= 90 and 8 <= mean_longitude <= 37:
+        plausibility_warnings.append(
+            "Latitude and longitude resemble reversed Indian coordinates. Confirm their order and hemispheres.")
+    # Only apply near-identity expectations when the source already resembles a
+    # metre-based projected grid. Local/paper CAD coordinates may legitimately
+    # need a large rotation or scale and are therefore not judged here.
+    median_x = sorted(abs(point.source_x) for point in points)[len(points) // 2]
+    median_y = sorted(abs(point.source_y) for point in points)[len(points) // 2]
+    projected_grid_like = 100_000 <= median_x <= 1_000_000 and median_y >= 100_000
+    if projected_grid_like and abs(scale - 1.0) > 0.01:
+        plausibility_warnings.append(
+            f"The source resembles a projected metre grid but fitted scale is {scale:.8f}; confirm units and CRS.")
+    if projected_grid_like and abs(rotation) > 5.0:
+        plausibility_warnings.append(
+            f"The source resembles a projected grid but fitted rotation is {rotation:.4f}°; confirm axis order and CRS.")
+    if plausibility_warnings and status == "pass":
+        status = "review"
+        quality_notes.extend(plausibility_warnings)
     source_area = _polygon_area(source)
     expected_area = _polygon_area(target)
     transformed_area = _polygon_area(transformed)
@@ -297,6 +319,7 @@ def solve(points, target_crs=None, holdout_index=None):
         },
         "input_coordinate_precision_metres": precision_metres,
         "quality_notes": quality_notes,
+        "plausibility_warnings": plausibility_warnings,
         "source_control_polygon_area": source_area,
         "target_control_polygon_area_square_metres": expected_area,
         "transformed_control_polygon_area_square_metres": transformed_area,

@@ -34,6 +34,35 @@ def test_common_mining_abbreviations_and_spelling_are_recognised():
         "Prop. IVth year Mineral Reject Back Fill") == "PROP. BACKFILL DUMP"
     assert semantic_layers.category_for_map_annotation(
         "III Yr", "Third Year working plan") == "PROP. YEAR WISE WORKING"
+    assert semantic_layers.category_for_text("PROPOSED QUARRY") == "PROP. PIT"
+    assert semantic_layers.category_for_text(
+        "PROPOSED OVER BURDEN DUMP") == "PROP. OVERBURDEN / WASTE DUMP"
+    assert semantic_layers.category_for_text("RECLAIMED AREA") == "RECLAIMED AREA"
+    assert semantic_layers.category_for_text("QUARRY") is None
+
+
+def test_mining_geometry_audit_checks_containment_pillars_area_and_buffers():
+    lease = _record(
+        "LWPOLYLINE", Polygon([(0, 0), (100, 0), (100, 100), (0, 100)]),
+        layer="LEASE BOUNDARY")
+    pit = _record(
+        "LWPOLYLINE", Polygon([(10, 10), (30, 10), (30, 30), (10, 30)]),
+        layer="EXIST. PIT")
+    outside_dump = _record(
+        "LWPOLYLINE", Polygon([(90, 90), (110, 90), (110, 110), (90, 110)]),
+        layer="EXIST. DUMP")
+    pillar = _record("POINT", Point(50, 50), layer="BOUNDARY PILLAR")
+    barrier = _record(
+        "LWPOLYLINE", Polygon([(-20, -20), (120, -20), (120, 120), (-20, 120)]),
+        layer="7.5M STATUTORY BARRIER")
+    classified, _ = semantic_layers.classify_records(
+        [lease, pit, outside_dump, pillar, barrier])
+    audit = semantic_layers.mining_geometry_audit(classified)
+    assert audit["lease_areas"][0]["area_hectares"] == 1.0
+    codes = {issue["code"] for issue in audit["issues"]}
+    assert "feature_outside_lease" in codes
+    assert "pillar_off_boundary" in codes
+    assert "buffer_distance_mismatch" in codes
 
 
 def test_uncertain_geometry_is_not_silently_guessed():

@@ -1442,6 +1442,31 @@ class App(tk.Tk):
                 "Policy: file-local legend, constrained geometry rules, and saved human review.",
                 "Uncertain objects remain unclassified until a reviewer decides.",
             ]
+        audit = report.get("mining_geometry_audit")
+        if audit:
+            counts = audit.get("counts", {})
+            lines += [
+                "", "MINING GEOMETRY QA",
+                f"Status: {str(audit.get('status', 'review')).upper()}",
+                f"Plans checked: {audit.get('plans_checked', 0)}",
+                f"Controlled pits/dumps/areas checked: {audit.get('controlled_features_checked', 0)}",
+                f"Errors: {counts.get('error', 0)}    Review items: {counts.get('review', 0)}",
+            ]
+            for lease in audit.get("lease_areas", ()):
+                lines.append(
+                    f"Lease area — {lease.get('plan', 'Plan')}: "
+                    f"{float(lease.get('area_hectares', 0)):.4f} ha")
+            for issue in audit.get("issues", ())[:12]:
+                lines.append(f"- {issue.get('severity', 'review').upper()}: {issue.get('message', '')}")
+            if len(audit.get("issues", ())) > 12:
+                lines.append("- Additional findings are included in the JSON report.")
+        preset = report.get("government_clean_preset")
+        if preset:
+            lines += [
+                "", "GOVERNMENT CLEAN PRESET",
+                f"Removed decorative records: {preset.get('records_removed', 0)}",
+                "Normal/full exports are not changed by this preset.",
+            ]
         b = data["wgs84_bounds"]
         lines += ["", f"Longitude: {b[0]:.7f} to {b[2]:.7f}", f"Latitude:  {b[1]:.7f} to {b[3]:.7f}",
                   "", "CHECK BEFORE USING", "Open in Google Earth and compare known survey boundary points.",
