@@ -12,17 +12,20 @@ from collections import Counter
 from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 import xml.etree.ElementTree as ET
+from pyproj import CRS, Geod, Transformer
 from shapely.geometry import Polygon, MultiPolygon
 from shapely import make_valid
 
 from vendor import cad_to_gis as cad
 import plan_sheets
+import review_rules
 import semantic_layers
 
 NS = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", NS)
-APP_VERSION = "0.9.3"
+APP_VERSION = "0.12.0"
 APP_AUTHOR = "Dhruv Menaria"
+WGS84_GEOD = Geod(ellps="WGS84")
 
 
 @dataclass(frozen=True)
@@ -48,7 +51,10 @@ class Options:
     exclude_sheet_frame: bool = False
     semantic_folders: bool = True
     semantic_style_hints: tuple = ()
+    semantic_plan_style_hints: tuple = ()
+    semantic_dominant_style_hints: tuple = ()
     semantic_categories: tuple[str, ...] = ()
+    coordinate_control_json: str = ""
 
 
 def el(parent, tag, text=None, **attributes):
@@ -129,6 +135,87 @@ def preview(options, *, cancel=None, log=lambda _: None, progress=lambda *_: Non
                            progress=progress)
 
 
+def prepare_semantic_review(options, *, cancel=None, log=lambda _: None,
+                            progress=lambda *_: None):
+    """Extract and classify source-coordinate records for interactive review."""
+    cad.require_runtime()
+    job = cad.validate_job(job_for(options), for_writing=False)
+    token = cancel or cad.CancellationToken()
+    quality = cad.QualityReport(job)
+    progress(0.02, "Reading drawing objects")
+    extractor = cad.DXFExtractor(job, quality, token, progress, log)
+    records = extractor.extract_all()
+    plan_detection = None
+    if options.plan_ids is not None:
+        progress(0.58, "Aligning selected plan sheets")
+        plan_detection = analyze_plan_sheets(options)
+        if not plan_detection.get("available"):
+            raise ValueError(plan_detection.get("reason") or
+                             "Plan sheets could not be aligned for review.")
+        records = plan_sheets.align_records(
+            records, plan_detection, options.plan_ids,
+            margin=options.plan_margin, cancel=token,
+            include_plan_boundary=not options.exclude_plan_boundary,
+            include_sheet_frame=not options.exclude_sheet_frame)
+
+    progress(0.68, "Reading the drawing legend")
+    hints = {
+        (family, color, linetype): category
+        for family, color, linetype, category in options.semantic_style_hints
+    }
+    plan_hints = {
+        (plan_id, (family, color, linetype)): category
+        for plan_id, family, color, linetype, category
+        in options.semantic_plan_style_hints
+    }
+    dominant_hints = {
+        (family, color, linetype): category
+        for family, color, linetype, category in options.semantic_dominant_style_hints
+    }
+    allowed_categories = set(options.semantic_categories)
+    legend_report = None
+    try:
+        local_hints, legend_report = semantic_layers.learn_legend_styles_from_document(
+            extractor.doc, options.input_path, plan_detection=plan_detection)
+        hints.update(local_hints)
+        for rule in legend_report.get("plan_style_rules", ()):
+            plan_hints[(str(rule["plan_id"]), tuple(rule["signature"]))] = \
+                str(rule["category"])
+        for rule in legend_report.get("dominant_style_rules", ()):
+            dominant_hints[tuple(rule["signature"])] = str(rule["category"])
+        allowed_categories.update(legend_report.get("categories_found", ()))
+    except Exception as exc:
+        legend_report = {
+            "source_drawing": str(Path(options.input_path).expanduser().resolve()),
+            "warning": f"Legend reading was unavailable: {exc}",
+            "scope": "current_source_dxf_only",
+        }
+        log(legend_report["warning"])
+
+    rules_document = review_rules.load_document(options.input_path)
+    if rules_document.get("warning"):
+        log(rules_document["warning"])
+    progress(0.82, "Classifying drawing objects")
+    records, semantic_summary = semantic_layers.classify_records(
+        records, style_hints=hints, plan_style_hints=plan_hints,
+        dominant_style_hints=dominant_hints,
+        allowed_categories=allowed_categories,
+        manual_rules=rules_document.get("rules", ()))
+    semantic_summary["source_legend"] = legend_report
+    semantic_summary["review_rules_path"] = str(review_rules.rule_path(options.input_path))
+    unclassified = [record for record in records
+                    if record.get("semantic_category") == "UNCLASSIFIED - REVIEW"]
+    progress(1.0, "Classification review ready")
+    return {
+        "records": records,
+        "unclassified": unclassified,
+        "summary": semantic_summary,
+        "quality_report": quality.to_dict(),
+        "rules": list(rules_document.get("rules", ())),
+        "rules_path": str(review_rules.rule_path(options.input_path)),
+    }
+
+
 def _color(value, alpha="ff"):
     value = str(value or "#66B5FF").lstrip("#")
     if len(value) != 6 or any(c not in "0123456789abcdefABCDEF" for c in value):
@@ -145,6 +232,144 @@ def _check_geometry(geometry):
             raise ValueError("Coordinates are outside longitude/latitude limits. Check the source CRS and units.")
     if isinstance(geometry, (Polygon, MultiPolygon)) and not geometry.is_valid:
         raise ValueError("An invalid geometry was found. Correct the drawing before exporting this layer.")
+
+
+def _polygon_metrics(geometry):
+    """Return geodesic area/perimeter for a WGS84 polygonal geometry."""
+    polygons = [geometry] if isinstance(geometry, Polygon) else list(geometry.geoms)
+    area_square_metres = 0.0
+    perimeter_metres = 0.0
+    for polygon in polygons:
+        area, perimeter = WGS84_GEOD.geometry_area_perimeter(polygon)
+        area_square_metres += abs(float(area))
+        perimeter_metres += abs(float(perimeter))
+    return area_square_metres, perimeter_metres
+
+
+def _same_crs(left, right):
+    try:
+        return cad.parse_crs(left).equals(cad.parse_crs(right))
+    except Exception:
+        return False
+
+
+def _plan_preflight(options):
+    """Prevent a repeated paper-plan layout from becoming a plausible but wrong map."""
+    if Path(options.input_path).suffix.lower() != ".dxf":
+        return None
+    detection = analyze_plan_sheets(options)
+    if not detection.get("available"):
+        return None
+    plans = detection.get("plans") or []
+    if options.plan_ids is None:
+        raise ValueError(
+            f"This drawing contains {len(plans)} repeated side-by-side plan sheets. "
+            "Ordinary export would place the paper layouts at different geographic "
+            "locations. Enable 'Clip and align detected plan maps', review the detected "
+            "plans, and export in Plan mode."
+        )
+    suggested = detection.get("suggested_crs")
+    if suggested and not _same_crs(options.source_crs, suggested):
+        raise ValueError(
+            f"The embedded survey labels place these plan sheets in {suggested}, but "
+            f"the selected source CRS is {options.source_crs}. Confirm the survey CRS "
+            "before exporting."
+        )
+    return detection
+
+
+def _coordinate_roundtrip(records, options, sample_limit=10000):
+    """Measure numeric CRS round-trip stability on representative source vertices."""
+    source = CRS.from_user_input(options.source_crs)
+    target = CRS.from_epsg(4326)
+    forward = Transformer.from_crs(source, target, always_xy=True)
+    reverse = Transformer.from_crs(target, source, always_xy=True)
+    angle = math.radians(options.rotation_degrees)
+    cosine, sine = math.cos(angle), math.sin(angle)
+    residuals = []
+    for record in records:
+        geometry = record.get("geometry")
+        if geometry is None or geometry.is_empty:
+            continue
+        for coordinate in cad.shapely.get_coordinates(geometry):
+            x = float(coordinate[0]) * options.coordinate_scale
+            y = float(coordinate[1]) * options.coordinate_scale
+            x, y = (x * cosine - y * sine + options.offset_x,
+                    x * sine + y * cosine + options.offset_y)
+            lon, lat = forward.transform(x, y, errcheck=True)
+            rx, ry = reverse.transform(lon, lat, errcheck=True)
+            if source.is_projected:
+                factor = float(source.axis_info[0].unit_conversion_factor or 1.0)
+                residual = math.hypot(rx - x, ry - y) * factor
+            else:
+                _, _, residual = WGS84_GEOD.inv(x, y, rx, ry)
+            if math.isfinite(residual):
+                residuals.append(float(residual))
+            if len(residuals) >= sample_limit:
+                break
+        if len(residuals) >= sample_limit:
+            break
+    if not residuals:
+        return {"samples": 0, "status": "not_checked"}
+    maximum = max(residuals)
+    rms = math.sqrt(sum(value * value for value in residuals) / len(residuals))
+    return {
+        "samples": len(residuals), "maximum_residual_metres": maximum,
+        "rms_residual_metres": rms,
+        "review_threshold_metres": 0.05,
+        "status": "pass" if maximum <= 0.05 else "review",
+        "scope": "Numerical CRS forward/inverse stability; this does not prove that the selected CRS is the correct survey CRS.",
+    }
+
+
+def _coordinate_control_preflight(options):
+    if not options.coordinate_control_json:
+        return None
+    try:
+        report = json.loads(options.coordinate_control_json)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"The coordinate-control report is invalid: {exc}") from exc
+    if not isinstance(report, dict) or int(report.get("point_count", 0)) < 2:
+        raise ValueError("The coordinate-control report does not contain enough matched points.")
+    if report.get("status") == "fail":
+        raise ValueError("The coordinate-control fit failed its accuracy limits. Correct the controls before exporting.")
+    if not _same_crs(options.source_crs, report.get("target_crs")):
+        raise ValueError("The selected source CRS no longer matches the coordinate-control calibration.")
+    comparisons = (
+        ("applied_scale", options.coordinate_scale),
+        ("applied_rotation_degrees", options.rotation_degrees),
+        ("applied_offset_x", options.offset_x),
+        ("applied_offset_y", options.offset_y),
+    )
+    for name, current in comparisons:
+        fallback = name.removeprefix("applied_")
+        expected = float(report.get(name, report.get(fallback)))
+        tolerance = max(1e-9, abs(expected) * 1e-10)
+        if abs(float(current) - expected) > tolerance:
+            raise ValueError(
+                "Coordinate settings changed after calibration. Reopen the Coordinate Control "
+                "Wizard and calculate the fit again.")
+    return report
+
+
+def _validate_detected_location(report):
+    alignment = report.get("plan_sheet_alignment") or {}
+    location = alignment.get("detected_location") or {}
+    bounds = (report.get("mineplan_earth") or {}).get("wgs84_bounds")
+    if not bounds or not location:
+        return
+    lon = float(location["center_longitude"])
+    lat = float(location["center_latitude"])
+    west, south, east, north = map(float, bounds)
+    # Allow generous map furniture/crop margin, but reject a different region.
+    if not (west - 0.05 <= lon <= east + 0.05 and south - 0.05 <= lat <= north + 0.05):
+        raise ValueError(
+            "The exported plan does not cover the location stated by its embedded "
+            "latitude/longitude labels. Recheck the source CRS and plan alignment."
+        )
+    centre_lon, centre_lat = (west + east) / 2, (south + north) / 2
+    _, _, distance = WGS84_GEOD.inv(lon, lat, centre_lon, centre_lat)
+    alignment["export_centre_distance_from_detected_location_metres"] = abs(float(distance))
 
 
 def _geometry(parent, geometry, altitude):
@@ -178,6 +403,8 @@ def make_kml(output_layers, options, report, cancel=None):
         el(plan_folders[plan_name], "visibility", "1" if plan_index == 0 else "0")
         el(plan_folders[plan_name], "open", "0")
     counts, missing_heights, repaired_for_kml = Counter(), 0, 0
+    polygon_areas = Counter()
+    polygon_perimeters = Counter()
     bounds = [math.inf, math.inf, -math.inf, -math.inf]
     for item in output_layers:
         for _, row in item.frame.iterrows():
@@ -263,6 +490,16 @@ def make_kml(output_layers, options, report, cancel=None):
                 value = row.get(field)
                 if value is not None and str(value) not in {"nan", "None"}:
                     el(el(ext, "Data", name=field), "value", value)
+            if isinstance(geometry, (Polygon, MultiPolygon)):
+                area_square_metres, perimeter_metres = _polygon_metrics(geometry)
+                polygon_areas[layer] += area_square_metres
+                polygon_perimeters[layer] += perimeter_metres
+                for field, value in (
+                    ("area_square_metres", area_square_metres),
+                    ("area_hectares", area_square_metres / 10000.0),
+                    ("perimeter_metres", perimeter_metres),
+                ):
+                    el(el(ext, "Data", name=field), "value", f"{value:.6f}")
             if options.altitude_mode == "clampToGround":
                 geometry = cad.force_2d(geometry)
             _geometry(pm, geometry, options.altitude_mode)
@@ -290,6 +527,12 @@ def make_kml(output_layers, options, report, cancel=None):
         "source_crs_confirmed_by_user": options.location_confirmed,
         "height_reference_confirmed_by_user": options.heights_confirmed,
         "invalid_plan_geometries_repaired_for_kml": repaired_for_kml,
+        "polygon_area_hectares_by_layer": {
+            layer: area / 10000.0 for layer, area in sorted(polygon_areas.items())
+        },
+        "polygon_perimeter_metres_by_layer": {
+            layer: length for layer, length in sorted(polygon_perimeters.items())
+        },
         "notes": ["Detected plan sheets are clipped and aligned only when Plan mode is enabled.",
                   "Plan mode removes detected sheet furniture and consolidates identical shared map features.",
                   "Combined multi-plan files initially show one plan plus the shared base map.",
@@ -322,15 +565,22 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
     job = cad.validate_job(job_for(options, export=True), for_writing=False)
     token = cancel or cad.CancellationToken()
     quality = cad.QualityReport(job)
+    coordinate_control = _coordinate_control_preflight(options)
+    if coordinate_control and coordinate_control.get("status") == "review":
+        quality.add_issue(
+            "warning", "coordinate_control_review",
+            "The coordinate-control fit is within review limits but does not meet the strict pass limits. "
+            "A survey professional must review the per-point residuals.")
     report_path = output.with_suffix(".report.json")
     try:
+        progress(0.01, "Checking drawing layout and survey controls")
+        plan_detection = _plan_preflight(options)
         extractor = cad.DXFExtractor(job, quality, token, progress, log)
         records = extractor.extract_all()
-        plan_detection = None
         semantic_summary = None
         if options.plan_ids is not None:
             progress(0.66, "Detecting and aligning repeated plan sheets")
-            plan_detection = analyze_plan_sheets(options)
+            plan_detection = plan_detection or analyze_plan_sheets(options)
             if not plan_detection.get("available"):
                 raise ValueError(plan_detection.get("reason") or "Plan sheets could not be aligned.")
             records = plan_sheets.align_records(
@@ -345,12 +595,30 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
                 (family, color, linetype): category
                 for family, color, linetype, category in options.semantic_style_hints
             }
+            plan_hints = {
+                (plan_id, (family, color, linetype)): category
+                for plan_id, family, color, linetype, category
+                in options.semantic_plan_style_hints
+            }
+            dominant_hints = {
+                (family, color, linetype): category
+                for family, color, linetype, category
+                in options.semantic_dominant_style_hints
+            }
             allowed_categories = set(options.semantic_categories)
+            rules_document = review_rules.load_document(options.input_path)
+            if rules_document.get("warning"):
+                log(rules_document["warning"])
             if not allowed_categories:
                 try:
                     local_hints, legend_report = semantic_layers.learn_legend_styles_from_document(
-                        extractor.doc, options.input_path)
+                        extractor.doc, options.input_path, plan_detection=plan_detection)
                     hints.update(local_hints)
+                    for rule in legend_report.get("plan_style_rules", ()):
+                        plan_hints[(str(rule["plan_id"]), tuple(rule["signature"]))] = \
+                            str(rule["category"])
+                    for rule in legend_report.get("dominant_style_rules", ()):
+                        dominant_hints[tuple(rule["signature"])] = str(rule["category"])
                     allowed_categories.update(legend_report.get("categories_found", ()))
                     log(
                         f"This drawing contains {len(allowed_categories)} recognised legend "
@@ -362,14 +630,25 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
                         "scope": "current_source_dxf_only",
                     }
                     log(legend_report["warning"])
-            if allowed_categories:
+            if allowed_categories or rules_document.get("rules"):
                 progress(0.72, "Grouping features by this drawing's AutoCAD legend")
                 records, semantic_summary = semantic_layers.classify_records(
                     records, style_hints=hints,
-                    allowed_categories=allowed_categories)
+                    plan_style_hints=plan_hints,
+                    dominant_style_hints=dominant_hints,
+                    allowed_categories=allowed_categories,
+                    manual_rules=rules_document.get("rules", ()))
                 semantic_summary["source_legend"] = legend_report
+                semantic_summary["review_rules_path"] = str(
+                    review_rules.rule_path(options.input_path))
             else:
                 log("No recognised AutoCAD legend was found; preserving original CAD layer folders.")
+        roundtrip = _coordinate_roundtrip(records, options)
+        if roundtrip.get("status") == "review":
+            quality.add_issue(
+                "warning", "coordinate_roundtrip_residual",
+                "The numerical CRS forward/inverse residual exceeded 5 cm. Review the selected CRS and transformation grids."
+            )
         # Broken CAD hatch fills are not required for a line-based Google Earth
         # overlay. Keep them visible in QA, but do not reject an otherwise valid
         # export solely because a decorative fill could not be reconstructed.
@@ -387,6 +666,9 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
         report = quality.to_dict()
         report["application"] = "MinePlan Earth"
         report["application_version"] = APP_VERSION
+        report["coordinate_roundtrip"] = roundtrip
+        if coordinate_control is not None:
+            report["coordinate_control"] = coordinate_control
         if semantic_summary is not None:
             report["semantic_classification"] = semantic_summary
         if legend_report is not None:
@@ -408,6 +690,7 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
         if any(issue.severity == "error" for issue in quality.issues):
             raise ValueError("Some drawing objects failed extraction or transformation. See the report and log; correct or deselect those layers.")
         data = make_kml(layers, options, report, token)
+        _validate_detected_location(report)
         token.check()
         progress(0.92, "Writing and checking the export")
         if output.suffix.lower() == ".kmz":
@@ -509,6 +792,7 @@ def convert_submission(options, parent_directory, *, cancel=None,
                        log=lambda _: None, progress=lambda *_: None):
     """Create the reviewed eight-file government KMZ package plus separate QA."""
     job_for(options, export=True)
+    coordinate_control = _coordinate_control_preflight(options)
     if options.plan_ids is None:
         raise ValueError("Enable Plan mode and select the detected plan sheets first.")
     token = cancel or cad.CancellationToken()
@@ -541,7 +825,7 @@ def convert_submission(options, parent_directory, *, cancel=None,
     }
     try:
         legend_styles, legend_report = semantic_layers.learn_legend_styles_from_dxf(
-            options.input_path)
+            options.input_path, plan_detection=detection)
         log(
             f"Read {legend_report['legend_labels_found']} recognised legend entries "
             f"and learned {len(legend_styles)} file-local style rule(s).")
@@ -556,7 +840,7 @@ def convert_submission(options, parent_directory, *, cancel=None,
                 lambda value, status: progress(value * 0.04, status), log)
             legend_extractor.extract_all()
             legend_styles, legend_report = semantic_layers.learn_legend_styles_from_document(
-                legend_extractor.doc, options.input_path)
+                legend_extractor.doc, options.input_path, plan_detection=detection)
             log(
                 f"Read {legend_report['legend_labels_found']} recognised legend entries "
                 f"after preparing the drawing and learned {len(legend_styles)} rule(s).")
@@ -570,6 +854,12 @@ def convert_submission(options, parent_directory, *, cancel=None,
         (family, color, linetype, category)
         for (family, color, linetype), category in legend_styles.items())
     legend_categories = tuple(legend_report.get("categories_found", ()))
+    plan_style_hints = tuple(
+        (str(rule["plan_id"]), *tuple(rule["signature"]), str(rule["category"]))
+        for rule in legend_report.get("plan_style_rules", ()))
+    dominant_style_hints = tuple(
+        (*tuple(rule["signature"]), str(rule["category"]))
+        for rule in legend_report.get("dominant_style_rules", ()))
     log(f"Using {len(style_hints)} file-local semantic CAD style rule(s).")
 
     files = []
@@ -583,8 +873,12 @@ def convert_submission(options, parent_directory, *, cancel=None,
             options, plan_ids=tuple(group["plan_ids"]),
             document_name=Path(filename).stem,
             exclude_plan_boundary=filename != "ENVIRONMENT PLAN.kmz",
-            exclude_sheet_frame=filename != "ENVIRONMENT PLAN.kmz",
+            # The environment file keeps its 60 m/500 m study boundaries, not
+            # the AutoCAD paper frame surrounding the plate.
+            exclude_sheet_frame=True,
             semantic_folders=True, semantic_style_hints=style_hints,
+            semantic_plan_style_hints=plan_style_hints,
+            semantic_dominant_style_hints=dominant_style_hints,
             semantic_categories=legend_categories)
 
         def group_progress(value, status, i=index):
@@ -613,6 +907,10 @@ def convert_submission(options, parent_directory, *, cancel=None,
     produced = {item["filename"] for item in files}
     missing = [name for name in GOVERNMENT_FILENAMES if name not in produced]
     warnings = []
+    if coordinate_control and coordinate_control.get("status") == "review":
+        warnings.append(
+            "Coordinate-control calibration is at REVIEW status rather than strict PASS; "
+            "a survey professional must approve the residuals.")
     if missing:
         warnings.append("Expected package categories not generated: " + ", ".join(missing))
     unclassified = sum(item.get("semantic_classification", {}).get(
@@ -630,6 +928,7 @@ def convert_submission(options, parent_directory, *, cancel=None,
         "source_drawing": str(Path(options.input_path).expanduser().resolve()),
         "source_crs": options.source_crs,
         "source_crs_confirmed_by_user": options.location_confirmed,
+        "coordinate_control": coordinate_control,
         "review_required": True,
         "kmz_folder": str(kmz_folder),
         "qa_folder": str(qa_folder),
@@ -663,6 +962,18 @@ def convert_submission(options, parent_directory, *, cancel=None,
         "[ ] Review every UNCLASSIFIED folder and correct the source/mapping if necessary.",
         "[ ] Confirm the package requirements with the responsible qualified person.",
     ])
+    if coordinate_control:
+        checklist_lines.extend([
+            "", "COORDINATE CONTROL:",
+            f"Status: {str(coordinate_control.get('status')).upper()}",
+            f"Matched points: {coordinate_control.get('point_count')}",
+            f"RMS error: {float(coordinate_control.get('rms_error_metres', 0)):.3f} m",
+            f"Maximum fit error: {float(coordinate_control.get('maximum_fit_error_metres', 0)):.3f} m",
+        ])
+        if coordinate_control.get("holdout_error_metres") is not None:
+            checklist_lines.append(
+                "Independent verification error: "
+                f"{float(coordinate_control['holdout_error_metres']):.3f} m")
     if warnings:
         checklist_lines.extend(["", "WARNINGS:"] + ["- " + value for value in warnings])
     _atomic_bytes(checklist, "\n".join(checklist_lines).encode("utf-8"))

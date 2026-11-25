@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from collections import Counter, defaultdict
 import contextlib
+import json
 import math
 from pathlib import Path
 import re
@@ -32,15 +33,25 @@ CATEGORY_RULES = (
     ("PROP. BACKFILL DUMP", (r"\bBACKFILL DUMP\b",)),
     ("PROP. RETAINING WALL", (r"\bRETAINING WALL\b",)),
     ("PROP. GARLAND DRAIN", (r"\bGARLAND DRAIN\b",)),
-    ("PROP. SETTLING TANK", (r"\bSETTLING TANK\b",)),
     ("PROP. FENCING", (r"\bFENCING\b",)),
     ("PROP. PLANTATION", (r"\bPLANTATION\b",)),
+    ("PROP. LABOUR SHED", (r"\bLABOU?R SHED\b",)),
+    ("PROP. SETTLING TANK", (r"\bSETT(?:L)?ING TANK\b",)),
+    ("EXIST. BORE HOLE", (r"\bEXIST(?:ING)?\b.*\bBORE HOLE\b",)),
     ("PROP. BORE HOLE", (r"\bPBH\s*[- ]?\d*\b", r"\bBORE HOLE\b")),
     ("PROP. OFFICE", (r"\bPROP(?:OSED)?\b.*\bOFFICE\b", r"\bSTORE ROOM\b.*\bOFFICE\b")),
     ("PROP. HAULAGE ROAD", (r"\bHAULAGE ROAD\b",)),
     ("EXIST. ROAD", (r"\bEXIST(?:ING)?\b.*\bROAD\b", r"\bROAD\s*/?\s*RASTA\b")),
     ("EXIST. DUMP", (r"\bEXIST(?:ING)?\b.*\bDUMP\b",)),
     ("EXIST. PIT", (r"\bEXIST(?:ING)?\b.*\bPIT\b", r"\bPIT\s*[- ]?\d+\b", r"\bQUARRY\b")),
+    ("EXIST. WELL", (r"\bEXIST(?:ING)?\b.*\bWELL\b", r"\bWELL\b")),
+    ("EXIST. SCREENING", (r"\bEXIST(?:ING)?\b.*\bSC+RE+N+ING\b",)),
+    ("SURVEY STATION", (r"\bSURVEY STATION\b",)),
+    ("TREE", (r"\bTREE\b",)),
+    ("HUTMENTS", (r"\bHUTMENTS?\b",)),
+    ("NALA", (r"\bNALA\b",)),
+    ("WATER RESERVOIR AREA", (r"\bWATER RESERVOIR\b",)),
+    ("SOIL", (r"\bSOIL\b",)),
     ("CONTOUR", (r"\bCONTOUR\b",)),
     ("BENCH MARK", (r"\bBENCH MARK\b", r"\bB\s*M\b")),
     ("SECTION LINE", (r"\bSECTION LINE\b",)),
@@ -87,6 +98,40 @@ def category_for_layer(value):
     return aliases.get(text)
 
 
+def category_for_block(record):
+    """Read semantic evidence retained from named AutoCAD block references."""
+    values = [record.get("block_name"), record.get("block_path")]
+    attributes = record.get("block_attributes_json")
+    if attributes:
+        with contextlib.suppress(TypeError, ValueError):
+            parsed = json.loads(attributes) if isinstance(attributes, str) else attributes
+            if isinstance(parsed, dict):
+                values.extend(str(value) for value in parsed.values())
+    for value in values:
+        category = category_for_text(value)
+        if category:
+            return category
+    return None
+
+
+def category_for_map_annotation(value, plan_title=""):
+    """Recognise terse map labels without teaching them as legend samples."""
+    text = _normalise(value)
+    title = _normalise(plan_title)
+    if re.fullmatch(r"SC+RE+N+ING", text):
+        return "EXIST. SCREENING"
+    if "MINERAL REJECT BACK FILL" in text:
+        return "PROP. BACKFILL DUMP"
+    if "YEAR" in title and re.fullmatch(r"(?:I|II|III|IV|V)\s*YR", text):
+        return "PROP. YEAR WISE WORKING"
+    if "ENVIRONMENT" in title or "ENVIROMENT" in title:
+        if text in {"60M", "60 M"}:
+            return "60 M. BOUNDARY"
+        if text in {"500M", "500 M"}:
+            return "500 M. BOUNDARY"
+    return None
+
+
 def _original_layer(record):
     value = str(record.get("cad_layer") or "0")
     return value.split(" / ", 1)[-1]
@@ -102,10 +147,23 @@ def _style_signature(record):
     return family, color, linetype
 
 
+def style_signature(record):
+    """Public, JSON-friendly style identity used by manual review rules."""
+    return _style_signature(record)
+
+
+def available_categories():
+    return sorted({category for category, _ in CATEGORY_RULES})
+
+
 def _raw_entity_style(entity, doc):
     """Return a signature compatible with extracted-record style signatures."""
     entity_type = entity.dxftype().upper()
-    family = "AREA" if entity_type in {"HATCH", "SOLID", "TRACE", "3DFACE"} else "LINE"
+    closed_curve = False
+    with contextlib.suppress(Exception):
+        closed_curve = bool(entity.closed if entity_type == "LWPOLYLINE" else entity.is_closed)
+    family = "AREA" if entity_type in {"HATCH", "SOLID", "TRACE", "3DFACE"} \
+        or closed_curve else "LINE"
     layer_name = str(getattr(entity.dxf, "layer", "0") or "0")
     layer = None
     with contextlib.suppress(Exception):
@@ -165,7 +223,7 @@ def _entity_box(entity):
     return None
 
 
-def learn_legend_styles_from_document(doc, source_label="loaded drawing"):
+def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_detection=None):
     """Learn style/category rules from one already loaded DXF document.
 
     Rules are returned to the caller and are never persisted. A legend entry is
@@ -232,19 +290,55 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing"):
             continue
         candidates.sort(key=lambda item: item[0])
         sample = candidates[0][1]
-        observations.append({
-            "category": category,
-            "label": text.strip(),
-            "label_handle": getattr(label.dxf, "handle", None),
-            "sample_handle": getattr(sample.dxf, "handle", None),
-            "signature": _raw_entity_style(sample, doc),
-        })
+        plan = None
+        if plan_detection:
+            matches = []
+            for candidate in plan_detection.get("plans", ()):
+                bounds = candidate.get("sheet_bounds") or candidate.get("crop_bounds")
+                if not bounds:
+                    continue
+                if bounds[0] <= insertion.x <= bounds[2] and bounds[1] <= insertion.y <= bounds[3]:
+                    area = max(0.0, (bounds[2] - bounds[0]) * (bounds[3] - bounds[1]))
+                    matches.append((area, candidate))
+            if matches:
+                plan = min(matches, key=lambda item: item[0])[1]
+        best_score = candidates[0][0]
+        best_signature = _raw_entity_style(sample, doc)
+        # A legend symbol is often composed from several same-style entities
+        # (for example three arcs plus a closed polyline for a tree).  Capture
+        # each geometry family in that symbol, while rejecting differently
+        # coloured table borders or neighbouring legend rows.
+        sample_entities = []
+        seen_signatures = set()
+        for score, candidate in candidates:
+            signature = _raw_entity_style(candidate, doc)
+            if score > best_score + 1.0:
+                continue
+            if signature[1:] != best_signature[1:]:
+                continue
+            if signature in seen_signatures:
+                continue
+            seen_signatures.add(signature)
+            sample_entities.append((candidate, signature))
+        for candidate, signature in sample_entities:
+            observation = {
+                "category": category,
+                "label": text.strip(),
+                "label_handle": getattr(label.dxf, "handle", None),
+                "sample_handle": getattr(candidate.dxf, "handle", None),
+                "signature": signature,
+            }
+            if plan is not None:
+                observation["plan_id"] = str(plan.get("id"))
+                observation["plan_title"] = str(plan.get("title"))
+            observations.append(observation)
 
     votes = defaultdict(Counter)
     for observation in observations:
         votes[observation["signature"]][observation["category"]] += 1
     rules = {}
     ambiguous = []
+    dominant_rules = []
     for signature, categories in votes.items():
         category, count = categories.most_common(1)[0]
         total = sum(categories.values())
@@ -260,24 +354,59 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing"):
                 "signature": signature,
                 "votes": dict(categories.most_common()),
             })
+            ratio = count / total
+            # Contours are the only deliberately supported dominant-but-not-
+            # unanimous style: they are open linear geometry and are commonly
+            # repeated many times, while a single bore-hole sample may reuse
+            # the same colour. Geometry compatibility is checked again later.
+            if signature[0] == "LINE" and category == "CONTOUR" \
+                    and count >= 5 and ratio >= 0.90:
+                dominant_rules.append({
+                    "signature": signature, "category": category,
+                    "votes": count, "total_observations": total,
+                    "confidence": round(ratio, 4),
+                })
+    plan_votes = defaultdict(Counter)
+    for observation in observations:
+        plan_id = observation.get("plan_id")
+        if plan_id:
+            plan_votes[(plan_id, observation["signature"])][observation["category"]] += 1
+    plan_rules = []
+    for (plan_id, signature), categories in plan_votes.items():
+        category, count = categories.most_common(1)[0]
+        total = sum(categories.values())
+        if count == total:
+            plan_title = next((item.get("plan_title") for item in observations
+                               if item.get("plan_id") == plan_id), "")
+            plan_rules.append({
+                "plan_id": plan_id,
+                "plan_title": plan_title,
+                "signature": signature,
+                "category": category,
+                "observations": total,
+            })
     return rules, {
         "source_drawing": str(source),
         "legend_labels_found": len(observations),
         "style_rules_learned": len(rules),
+        "plan_style_rules_learned": len(plan_rules),
+        "plan_style_rules": plan_rules,
         "categories_found": sorted({item["category"] for item in observations}),
         "observations": observations,
         "ambiguous_styles": ambiguous,
+        "dominant_style_rules": dominant_rules,
         "skipped": dict(skipped),
         "scope": "current_source_dxf_only",
     }
 
 
-def learn_legend_styles_from_dxf(path):
+def learn_legend_styles_from_dxf(path, plan_detection=None):
     """Load one DXF and learn only the legend rules contained in that file."""
     import ezdxf
 
     source = Path(path).expanduser().resolve()
-    return learn_legend_styles_from_document(ezdxf.readfile(source), source)
+    return learn_legend_styles_from_document(
+        ezdxf.readfile(source), source, plan_detection=plan_detection)
 
 
 def learn_style_map(records):
@@ -327,30 +456,69 @@ def learn_style_map(records):
     return result
 
 
-def classify_records(records, style_hints=None, allowed_categories=None):
-    """Group records using only this drawing's explicit legend vocabulary.
+def classify_records(records, style_hints=None, plan_style_hints=None,
+                     dominant_style_hints=None, allowed_categories=None,
+                     manual_rules=None):
+    """Group records with file-local evidence and exact human-review rules.
 
-    Geometry is classified by an explicit CAD layer or an unambiguous legend
-    style. Proximity to a text label is deliberately not used: a nearby label
-    must never pull a sheet frame, boundary, or unrelated hatch into its folder.
+    Explicit layers and unambiguous legend styles are preferred. A small set of
+    constrained spatial relationships may attach details to already classified
+    geometry; anything uncertain remains reviewable rather than being guessed.
     """
     copied = [dict(record) for record in records]
+
+    def polygon_parts(geometry):
+        if geometry is None or geometry.is_empty:
+            return []
+        if geometry.geom_type == "Polygon":
+            return [geometry]
+        if geometry.geom_type in {"MultiPolygon", "GeometryCollection"}:
+            result = []
+            for part in geometry.geoms:
+                result.extend(polygon_parts(part))
+            return result
+        return []
     shared_style_map = dict(style_hints or {})
+    plan_style_map = dict(plan_style_hints or {})
+    dominant_style_map = dict(dominant_style_hints or {})
     allowed = {str(value) for value in (allowed_categories or ()) if str(value)}
     if allowed:
         shared_style_map = {
             signature: category for signature, category in shared_style_map.items()
             if category in allowed
         }
+        plan_style_map = {
+            key: category for key, category in plan_style_map.items()
+            if category in allowed
+        }
+        dominant_style_map = {
+            signature: category for signature, category in dominant_style_map.items()
+            if category in allowed
+        }
     by_plan = defaultdict(list)
     for index, record in enumerate(copied):
         by_plan[str(record.get("plan_title") or "Plan")].append(index)
 
-    counts = Counter()
-    methods = Counter()
-    plan_summaries = {}
     for plan_title, indexes in by_plan.items():
-        plan_counts = Counter()
+        environment_boundaries = {}
+        if "environment" in plan_title.casefold():
+            closed = [copied[index] for index in indexes
+                      if str(copied[index].get("entity_type") or "").upper()
+                      in {"LWPOLYLINE", "POLYLINE", "SPLINE"}
+                      and getattr(copied[index].get("geometry"), "geom_type", "")
+                      in {"Polygon", "MultiPolygon"}]
+            route_boundaries = [record for record in closed
+                                if _normalise(_original_layer(record)) == "ROUTES"]
+            if route_boundaries:
+                outer = max(route_boundaries, key=lambda item: item["geometry"].area)
+                outer_area = outer["geometry"].area
+                environment_boundaries[str(outer.get("entity_handle"))] = "500 M. BOUNDARY"
+                middle = [record for record in closed
+                          if _normalise(_original_layer(record)) == "0"
+                          and outer_area * 0.05 <= record["geometry"].area <= outer_area * 0.50]
+                if middle:
+                    barrier = max(middle, key=lambda item: item["geometry"].area)
+                    environment_boundaries[str(barrier.get("entity_handle"))] = "60 M. BOUNDARY"
         for index in indexes:
             record = copied[index]
             entity = str(record.get("entity_type") or "").upper()
@@ -358,10 +526,18 @@ def classify_records(records, style_hints=None, allowed_categories=None):
             category = None
             method = None
             confidence = None
+            boundary_category = environment_boundaries.get(str(record.get("entity_handle")))
+            if boundary_category and (not allowed or boundary_category in allowed):
+                category = boundary_category
+                method, confidence = "environment_boundary_geometry", 0.94
             if entity in TEXT_TYPES:
-                category = category_for_text(record.get("text_value"))
-                if category and (not allowed or category in allowed):
-                    method, confidence = "text_keyword", 0.98
+                direct_map_category = category_for_map_annotation(
+                    record.get("text_value"), plan_title)
+                category = category_for_text(record.get("text_value")) or direct_map_category
+                if category and (direct_map_category or not allowed or category in allowed):
+                    method, confidence = (
+                        ("map_annotation", 0.95) if direct_map_category
+                        else ("text_keyword", 0.98))
                 else:
                     category = None
             if category is None:
@@ -371,9 +547,28 @@ def classify_records(records, style_hints=None, allowed_categories=None):
                 else:
                     category = None
             if category is None:
+                category = category_for_block(record)
+                if category and (not allowed or category in allowed):
+                    method, confidence = "named_block_or_attribute", 0.96
+                else:
+                    category = None
+            if category is None:
+                plan_id = str(record.get("plan_id") or "")
+                category = plan_style_map.get((plan_id, _style_signature(record)))
+                if category:
+                    method, confidence = "plan_legend_style", 0.93
+            if category is None:
                 category = shared_style_map.get(_style_signature(record))
                 if category:
                     method, confidence = "legend_style", 0.90
+            if category is None:
+                dominant = dominant_style_map.get(_style_signature(record))
+                geometry_type = getattr(geometry, "geom_type", "")
+                if dominant == "CONTOUR" and entity in {
+                        "LINE", "LWPOLYLINE", "POLYLINE", "SPLINE"} \
+                        and geometry_type not in {"Polygon", "MultiPolygon"}:
+                    category = dominant
+                    method, confidence = "dominant_contour_legend_style", 0.84
             if category is None:
                 category = "UNCLASSIFIED - REVIEW"
                 method, confidence = "unclassified", 0.0
@@ -383,9 +578,235 @@ def classify_records(records, style_hints=None, allowed_categories=None):
             record["classification_method"] = method
             record["classification_confidence"] = confidence
             record["cad_layer"] = f"{plan_title} / {category}"
-            counts[category] += 1
-            methods[method] += 1
-            plan_counts[category] += 1
+
+    # Use spatial propagation only from already explicit, high-confidence
+    # geometry.  This captures pit bench/RL details and contour labels without
+    # letting an arbitrary nearby annotation relabel unrelated sheet content.
+    for plan_title, indexes in by_plan.items():
+        pit_polygons = [part for index in indexes
+                        if copied[index].get("semantic_category") == "EXIST. PIT"
+                        for part in polygon_parts(copied[index].get("geometry"))]
+        for index in indexes:
+            record = copied[index]
+            if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+                continue
+            geometry = record.get("geometry")
+            if geometry is None or geometry.is_empty:
+                continue
+            if pit_polygons:
+                covered = any(polygon.covers(geometry.representative_point())
+                              and geometry.envelope.area <= polygon.envelope.area * 1.05
+                              for polygon in pit_polygons)
+                if covered:
+                    record["semantic_category"] = "EXIST. PIT"
+                    record["classification_method"] = "inside_explicit_pit"
+                    record["classification_confidence"] = 0.86
+                    record["cad_layer"] = f"{plan_title} / EXIST. PIT"
+
+        contour_geometries = [copied[index]["geometry"] for index in indexes
+                              if copied[index].get("semantic_category") == "CONTOUR"
+                              and copied[index].get("geometry") is not None]
+        symbol_categories = {
+            "EXIST. WELL", "EXIST. BORE HOLE", "PROP. BORE HOLE",
+            "BENCH MARK", "SURVEY STATION", "TREE", "Boundary pillars",
+        }
+        area_categories = {
+            "PROP. OFFICE", "PROP. LABOUR SHED", "PROP. SETTLING TANK",
+            "PROP. MINERAL STACK YARD", "PROP. MINERAL REJECT DUMP",
+            "PROP. BACKFILL DUMP", "PROP. RETAINING WALL", "PROP. PLANTATION",
+            "EXIST. PIT", "EXIST. DUMP", "EXIST. SCREENING", "HUTMENTS",
+            "WATER RESERVOIR AREA", "SOIL", "MINERALIZED BODY",
+        }
+        linear_categories = {
+            "LEASE BOUNDARY", "7.5M. STATUTORY BARRIER", "60 M. BOUNDARY",
+            "500 M. BOUNDARY", "ELECTRIC LINE", "EXIST. ROAD",
+            "PROP. HAULAGE ROAD", "PROP. FENCING", "PROP. GARLAND DRAIN",
+            "SECTION LINE", "GRID LINE", "ULTIMATE PIT LIMIT",
+        }
+        semantic_labels = [copied[index] for index in indexes
+                           if copied[index].get("semantic_category") not in {
+                               None, "UNCLASSIFIED - REVIEW"}
+                           and str(copied[index].get("entity_type") or "").upper() in TEXT_TYPES
+                           and copied[index].get("geometry") is not None]
+        labelled_points = [record for record in semantic_labels
+                           if record.get("semantic_category") in symbol_categories]
+        plan_geometries = [copied[index].get("geometry") for index in indexes]
+        plan_geometries = [geometry for geometry in plan_geometries
+                           if geometry is not None and not geometry.is_empty]
+        if plan_geometries:
+            plan_bounds = (
+                min(geometry.bounds[0] for geometry in plan_geometries),
+                min(geometry.bounds[1] for geometry in plan_geometries),
+                max(geometry.bounds[2] for geometry in plan_geometries),
+                max(geometry.bounds[3] for geometry in plan_geometries),
+            )
+            plan_diagonal = math.hypot(
+                plan_bounds[2] - plan_bounds[0], plan_bounds[3] - plan_bounds[1])
+        else:
+            plan_diagonal = 1.0
+        for index in indexes:
+            record = copied[index]
+            if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+                continue
+            geometry = record.get("geometry")
+            if geometry is None or geometry.is_empty:
+                continue
+            entity = str(record.get("entity_type") or "").upper()
+            text = _normalise(record.get("text_value"))
+            height = float(record.get("text_height") or 1.0)
+            if entity in TEXT_TYPES and re.fullmatch(r"\d{2,4}(?:\s+\d+)?", text):
+                if contour_geometries and min(geometry.distance(line) for line in contour_geometries) \
+                        <= max(4.0, height * 2.5):
+                    record["semantic_category"] = "CONTOUR"
+                    record["classification_method"] = "attached_contour_label"
+                    record["classification_confidence"] = 0.88
+                    record["cad_layer"] = f"{plan_title} / CONTOUR"
+                    continue
+            # A semantic label placed inside one closed area is strong local
+            # evidence even when both objects live on generic layer 0.
+            if geometry.geom_type in {"Polygon", "MultiPolygon"}:
+                inside = {label["semantic_category"] for label in semantic_labels
+                          if label.get("semantic_category") in area_categories
+                          and geometry.covers(label["geometry"].representative_point())}
+                if len(inside) == 1:
+                    category = inside.pop()
+                    record["semantic_category"] = category
+                    record["classification_method"] = "label_inside_closed_area"
+                    record["classification_confidence"] = 0.91
+                    record["cad_layer"] = f"{plan_title} / {category}"
+                    continue
+
+            # Symbols are frequently exploded into several arcs, circles and
+            # short polylines. Attach each small component only when nearby
+            # semantic labels agree on one category and colour/distance gives
+            # direct visual evidence. Long map lines are deliberately excluded.
+            if entity not in {
+                    "CIRCLE", "HATCH", "INSERT", "POINT", "ARC", "ELLIPSE",
+                    "LINE", "LWPOLYLINE", "POLYLINE", "SPLINE"}:
+                continue
+            xmin, ymin, xmax, ymax = geometry.bounds
+            span = math.hypot(xmax - xmin, ymax - ymin)
+            candidates = []
+            for label in labelled_points:
+                label_height = float(label.get("text_height") or 1.0)
+                maximum_span = max(label_height * 24.0, plan_diagonal * 0.035)
+                if span > maximum_span:
+                    continue
+                distance = geometry.distance(label["geometry"])
+                same_color = str(record.get("color_hex") or "").upper() == \
+                    str(label.get("color_hex") or "").upper()
+                limit = max(4.0, label_height * (10.0 if same_color else 3.0))
+                if distance <= limit:
+                    candidates.append((distance, label["semantic_category"], same_color))
+            categories = {candidate[1] for candidate in candidates}
+            if len(categories) == 1 and candidates:
+                distance, category, same_color = min(candidates, key=lambda item: item[0])
+                record["semantic_category"] = category
+                record["classification_method"] = "connected_symbol_or_leader"
+                record["classification_confidence"] = 0.89 if same_color else 0.84
+                record["cad_layer"] = f"{plan_title} / {category}"
+                continue
+
+            # A long linear feature may have its name printed directly on it.
+            # Require the label and line to share a colour and require every
+            # nearby eligible label to agree, preventing a crossing line from
+            # being claimed by an unrelated annotation.
+            if entity in {"LINE", "LWPOLYLINE", "POLYLINE", "SPLINE"} \
+                    and geometry.geom_type not in {"Polygon", "MultiPolygon"}:
+                line_candidates = []
+                for label in semantic_labels:
+                    if label.get("semantic_category") not in linear_categories:
+                        continue
+                    if str(record.get("color_hex") or "").upper() != \
+                            str(label.get("color_hex") or "").upper():
+                        continue
+                    label_height = float(label.get("text_height") or 1.0)
+                    distance = geometry.distance(label["geometry"])
+                    if distance <= max(4.0, label_height * 10.0):
+                        line_candidates.append((distance, label["semantic_category"]))
+                line_categories_found = {candidate[1] for candidate in line_candidates}
+                if len(line_categories_found) == 1:
+                    category = line_categories_found.pop()
+                    record["semantic_category"] = category
+                    record["classification_method"] = "same_colour_linear_label"
+                    record["classification_confidence"] = 0.87
+                    record["cad_layer"] = f"{plan_title} / {category}"
+
+    # Near-identical geometry repeated on separately copied/aligned plan plates
+    # represents the same real-world feature. Propagate only when multiple plan
+    # copies agree on one already-classified category.
+    with contextlib.suppress(Exception):
+        from shapely import force_2d, normalize, set_precision
+        repeated = defaultdict(list)
+        for index, record in enumerate(copied):
+            geometry = record.get("geometry")
+            if geometry is None or geometry.is_empty:
+                continue
+            canonical = normalize(set_precision(force_2d(geometry), 0.25))
+            text = _normalise(record.get("text_value"))
+            repeated[(geometry.geom_type, text, canonical.wkb)].append(index)
+        for indexes in repeated.values():
+            plan_ids = {str(copied[index].get("plan_id") or "") for index in indexes}
+            if len(plan_ids) < 2:
+                continue
+            categories = {copied[index].get("semantic_category") for index in indexes
+                          if copied[index].get("semantic_category") != "UNCLASSIFIED - REVIEW"}
+            if len(categories) != 1:
+                continue
+            category = categories.pop()
+            for index in indexes:
+                record = copied[index]
+                if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+                    continue
+                plan_title = str(record.get("plan_title") or "Plan")
+                record["semantic_category"] = category
+                record["classification_method"] = "repeated_aligned_geometry"
+                record["classification_confidence"] = 0.92
+                record["cad_layer"] = f"{plan_title} / {category}"
+
+    # Human review is the final authority for this exact drawing. Entity rules
+    # affect one source object; matching-style rules remain constrained to the
+    # reviewed plan and original CAD layer.
+    manual_rules = [rule for rule in (manual_rules or ()) if isinstance(rule, dict)]
+    for record in copied:
+        # The review window only resolves uncertain objects. Never let a broad
+        # style decision replace an explicit layer or legend classification.
+        if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+            continue
+        plan_id = str(record.get("plan_id") or "")
+        handle = str(record.get("entity_handle") or "")
+        original_layer = str(record.get("original_cad_layer") or _original_layer(record))
+        signature = _style_signature(record)
+        matching = None
+        for rule in manual_rules:
+            if str(rule.get("plan_id") or "") != plan_id:
+                continue
+            scope = str(rule.get("scope") or "entity")
+            if scope == "entity" and handle and \
+                    str(rule.get("entity_handle") or "") == handle:
+                matching = rule
+                break
+            if scope == "style" and tuple(rule.get("signature") or ()) == signature and \
+                    str(rule.get("original_layer") or "") == original_layer:
+                matching = rule
+        if matching is None:
+            continue
+        category = str(matching.get("category") or "").strip()
+        if not category or category == "UNCLASSIFIED - REVIEW":
+            continue
+        plan_title = str(record.get("plan_title") or "Plan")
+        record["semantic_category"] = category
+        record["classification_method"] = (
+            "manual_entity_rule" if matching.get("scope") == "entity"
+            else "manual_matching_style_rule")
+        record["classification_confidence"] = 1.0
+        record["cad_layer"] = f"{plan_title} / {category}"
+
+    counts = Counter(record.get("semantic_category") for record in copied)
+    methods = Counter(record.get("classification_method") for record in copied)
+    plan_summaries = {}
+    for plan_title, indexes in by_plan.items():
+        plan_counts = Counter(copied[index].get("semantic_category") for index in indexes)
         plan_summaries[plan_title] = dict(plan_counts.most_common())
 
     total = len(copied)
@@ -398,8 +819,13 @@ def classify_records(records, style_hints=None, allowed_categories=None):
         "categories": dict(counts.most_common()),
         "methods": dict(methods.most_common()),
         "shared_style_rules": len(shared_style_map),
+        "plan_style_rules": len(plan_style_map),
+        "dominant_style_rules": len(dominant_style_map),
+        "manual_rules_loaded": len(manual_rules),
         "allowed_legend_categories": sorted(allowed),
-        "classification_policy": "explicit_layer_or_unambiguous_current_file_legend_style",
+        "classification_policy": (
+            "explicit_layers_named_blocks_file_local_legend_constrained_geometry_"
+            "repeated_plan_evidence_and_exact_manual_review"),
         "plans": plan_summaries,
         "review_required": True,
     }

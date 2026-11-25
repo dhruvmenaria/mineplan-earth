@@ -2,12 +2,12 @@
 
 **Dhruv Menaria**
 
-Version 0.9.2 includes a refreshed desktop interface with a clearer five-step
-workflow, stronger export actions, improved layer selection, and persistent
-status/progress feedback. It also recognises common two-line AutoCAD DMS
-latitude/longitude labels even when N/E prefixes are omitted or the degree
-symbol is encoding-corrupted. The exact `OUARRY` CAD-layer typo is treated as
-`QUARRY`, safely grouping those outlines under `EXIST. PIT`.
+Version 0.12.0 adds named-block, connected-symbol, repeated-geometry and
+constrained nearby-label classification alongside the Coordinate Control Wizard
+and interactive review. The wizard fits matched CAD X/Y and authoritative survey
+latitude/longitude controls, reports every residual and an optional independent
+holdout check, and blocks failed or stale calibrations. Uncertain drawing
+objects can then be reviewed and assigned safely to semantic folders.
 
 Local Windows desktop converter for DXF/DWG drawing outlines to Google Earth KML/KMZ.
 Built on the MIT-licensed CAD extraction engine from [CAD to GIS Studio](https://github.com/ricbencar/cad-to-gis-convert).
@@ -37,15 +37,46 @@ The initial dependency installation requires internet access. Some specialized c
 2. Include/exclude layers with a click. Remove title blocks, legends, and other sheet furniture as appropriate.
 3. If the drawing contains repeated side-by-side plans, the app enables **Clip and align detected plan maps**. Open **Choose detected plans / map margin** to select individual years or plan types.
 4. Preview the selected content. Normal preview uses original drawing coordinates; Plan mode previews the clipped maps after alignment.
-5. Enter the **verified source CRS**, supplied by the survey team. Presets are conveniences, not suggestions for your drawing.
-6. Check drawing units. Advanced scale applies to X, Y, and Z; rotation is around the origin, followed by XY offsets and CRS transformation.
-7. Select ground mode or an appropriate elevation mode. Detected Plan mode is intentionally limited to a 2D ground overlay.
-8. Export and review the adjacent JSON report, including selected plans, control-fit residual, unsupported objects, and warnings.
-9. Open the result in Google Earth and compare independent known survey points before using it in a deliverable.
+5. Enter the **verified source CRS**, supplied by the survey team, or open **Coordinate Control Wizard** and fit matched CAD/survey controls.
+6. In the wizard, keep one point as an independent verification point whenever four or more controls are available. Review every residual before applying.
+7. Check drawing units. Advanced scale applies to X, Y, and Z; rotation is around the origin, followed by XY offsets and CRS transformation.
+8. Select ground mode or an appropriate elevation mode. Detected Plan mode is intentionally limited to a 2D ground overlay.
+9. Open **Review categories**. Inspect any uncertain objects and save only the decisions you can confirm from the source drawing or survey documentation.
+10. Export and review the adjacent JSON report, including selected plans, coordinate controls, unsupported objects, and warnings.
+11. Open the result in Google Earth and compare independent known survey points before using it in a deliverable.
 
 An EPSG code identifies what the numbers in your drawing already mean. Choosing the location you want is not enough.
 
 When a plan contains latitude/longitude boundary labels, MinePlan Earth calculates the lease centre and displays its confidence and coordinate count. Use **Google Maps** or **Earth Web** to inspect that location, or copy the coordinates. These buttons use ordinary web links: no Google Maps API key, account, or billing is required.
+
+## Coordinate Control Wizard
+
+Use authoritative controls from the survey report or the coordinate labels in
+the CAD drawing. The accepted CSV columns are:
+
+```text
+name,source_x,source_y,latitude,longitude
+A,1234.50,5678.25,26.74894444,75.22721944
+B,1320.10,5681.80,N26°44'57.10",E75°13'39.20"
+```
+
+The wizard converts WGS 84 latitude/longitude into a verified projected CRS,
+then calculates a 2D similarity/Helmert transformation containing uniform
+scale, rotation and translation. It reports calculated and expected coordinates,
+east/north residuals, RMS error, maximum error, coordinate-label precision,
+control-polygon area difference and possible outliers. With four or more points,
+the last point can be withheld from fitting as an independent check.
+
+The built-in decision limits are PASS at no more than 0.5 m RMS and 1.0 m
+maximum, REVIEW at no more than 2.0 m RMS and 5.0 m maximum, and FAIL above
+those values. A FAIL cannot be applied. REVIEW requires explicit confirmation.
+These software limits do not replace the accuracy standard required by the
+surveyor or government authority. Plan Mode avoids double transformation by
+applying only the calculated correction after its existing panel alignment.
+The full control table and transformation are embedded in every export report.
+
+Google Maps and satellite imagery are visual references only. They are not
+survey controls and no Google Maps API key is used to calculate coordinates.
 
 ## Large DXF Mode
 
@@ -58,9 +89,28 @@ Both full KMZ exports and Government Submission exports read the legends embedde
 in the current DXF and use only that file's recognised legend vocabulary for
 semantic Google Earth folders such as `LEASE BOUNDARY`, `CONTOUR`, `EXIST. PIT`,
 and `PROP. HAULAGE ROAD`. Learned legend rules apply only to that source drawing
-and are never reused for another file. Geometry that cannot be matched by an
-explicit CAD layer or an unambiguous legend style remains under
-`UNCLASSIFIED - REVIEW`; proximity to nearby text is never used to guess.
+and are never reused for another file. Legend matching is scoped to each plan
+plate, so a reused AutoCAD colour can mean different things on different
+plates. Numeric contour labels and geometry contained by an explicit pit
+boundary are attached only through constrained spatial rules. Everything else
+that cannot be matched remains under `UNCLASSIFIED - REVIEW`.
+The **Review categories** window lets a human resolve those uncertain objects.
+An individual rule targets one DXF entity handle; a matching-style rule is
+restricted to the same detected plan, original CAD layer, geometry family,
+colour and linetype. Rules are stored locally under `review_rules/`, never
+uploaded, and are bound to a SHA-256 digest of the source drawing. If the DXF
+changes, its old decisions are ignored and the drawing must be reviewed again.
+Before manual review, MinePlan also uses named AutoCAD block names/attributes,
+closed areas containing explicit labels, multi-part symbols connected to one
+agreeing label, conservative same-colour line labels, repeated aligned geometry
+across plan plates, and strongly dominant contour legend evidence. A nearby
+label is never sufficient when multiple nearby categories disagree. The review
+window explains whether an item remains uncertain because it is on generic
+layer `0`, its legend style has several meanings, its block name is unknown, or
+its text is only an annotation/value.
+Environment plates tolerate millimetre-level copied-boundary drift and the
+common `ENVIROMENT PLAN` spelling, and export the full 60 m/500 m study area
+without the surrounding AutoCAD paper frame.
 For local/non-georeferenced sheet coordinates, obtain a verified engineering transformation before exporting. Plan mode activates only when it can match repeated lease geometry to either explicit DXF survey POINT controls or a complete set of embedded latitude/longitude boundary labels.
 
 ## Features
@@ -74,6 +124,8 @@ For local/non-georeferenced sheet coordinates, obtain a verified engineering tra
 - Lines, points, closed boundaries, curves approximated with a configurable tolerance, block expansion, hatch boundaries, and other geometry supported by the upstream engine.
 - Ground, absolute, and relative altitude modes, with validation of finite coordinates and longitude/latitude ranges.
 - Exported geometry validity checks, XML roundtrip validation, KMZ archive verification, per-export JSON report, and atomic replacement of each file.
+- Repeated side-by-side paper plans are blocked from ordinary export and must use reviewed Plan mode, preventing plausible but geographically scattered output.
+- Polygon placemarks include geodesic area (square metres and hectares) and perimeter metadata; reports aggregate the same measurements by folder.
 - Invalid closed polygons are repaired with a topology-preserving geometry operation and recorded in the JSON QA report.
 - Failed non-HATCH extraction/transformation errors block export. Malformed HATCH fills are omitted and reported as warnings because the line overlay remains usable.
 - A damaged/recovered DXF may produce warnings: review them and compare with the original drawing.

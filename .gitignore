@@ -2,6 +2,7 @@
 __pycache__/
 .pytest_cache/
 output/
+review_rules/*.json
 inspection/
 .env
 .env.*

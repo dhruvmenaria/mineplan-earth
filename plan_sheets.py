@@ -26,6 +26,8 @@ class PlanSheet:
     translate_y: float
     match_error: float
     affine: tuple[float, float, float, float, float, float] | None = None
+    sheet_bounds: tuple[float, float, float, float] | None = None
+    frame_handle: str | None = None
 
 
 def _points(entity):
@@ -55,7 +57,7 @@ def _closed_loop(entity, tolerance=0.05):
     return None
 
 
-def _fingerprint(points, digits=3):
+def _fingerprint(points, digits=2):
     # Canonicalise start vertex and direction so an identical closed boundary
     # groups even when AutoCAD rewrites it from another corner.
     candidates = []
@@ -228,6 +230,10 @@ def _plain_text(entity):
 def _title_for(text):
     upper = re.sub(r"\s+", " ", text.upper())
     rules = [
+        # Environment plates can contain labels referring to conceptual and
+        # year-wise features, so their explicit plate title must win first.
+        ("ENVIRONMENT PLAN", "Environment Plan"),
+        ("ENVIROMENT PLAN", "Environment Plan"),
         ("SURFACE GEOLOGICAL", "Surface geological plan & section"),
         ("FIRST YEAR", "Proposed First Year working plan & section"),
         ("SECOND YEAR", "Second Year working plan & section"),
@@ -239,7 +245,6 @@ def _title_for(text):
         ("PROGRESSIVE CLOSURE", "Progressive Closure Plan & Section"),
         ("CONCEPTUAL", "Conceptual Plan & Section"),
         ("FINANCIAL ASSURANCE", "Financial Assurance Area Plan"),
-        ("ENVIRONMENT PLAN", "Environment Plan"),
         ("SURFACE PLAN", "Surface plan"),
     ]
     for needle, title in rules:
@@ -257,7 +262,11 @@ def _candidate_frames(modelspace):
         xs, ys = [p[0] for p in points], [p[1] for p in points]
         bounds = (min(xs), min(ys), max(xs), max(ys))
         width, height = bounds[2] - bounds[0], bounds[3] - bounds[1]
-        if 250 <= width <= 500 and 250 <= height <= 500:
+        # Ordinary plan plates are roughly 250-500 drawing units wide.  An
+        # environment plate often covers a 500 m study radius and therefore
+        # uses a much larger sheet frame.  Accept that frame here so its title
+        # is associated with the copied lease boundary inside it.
+        if 250 <= width <= 2500 and 250 <= height <= 2000:
             result.append((entity, bounds))
     return result
 
@@ -389,13 +398,16 @@ def detect(path, *, margin=25.0):
         xmax = max(x for x, _ in boundary) + margin
         ymax = max(y for _, y in boundary) + margin
 
-        containing = [bounds for _, bounds in frames
+        containing = [(frame_entity, bounds) for frame_entity, bounds in frames
                       if bounds[0] <= cx <= bounds[2] and bounds[1] <= cy <= bounds[3]]
         if containing:
-            frame = min(containing, key=lambda b: (b[2] - b[0]) * (b[3] - b[1]))
+            frame_entity, frame = min(
+                containing,
+                key=lambda item: (item[1][2] - item[1][0]) * (item[1][3] - item[1][1]))
             panel_text = " ".join(value for x, y, value in texts
                                   if frame[0] <= x <= frame[2] and frame[1] <= y <= frame[3])
         else:
+            frame_entity, frame = None, (xmin, ymin, xmax, ymax)
             panel_text = " ".join(value for x, y, value in texts
                                   if xmin <= x <= xmax and ymin <= y <= ymax)
         title = _title_for(panel_text)
@@ -407,7 +419,8 @@ def detect(path, *, margin=25.0):
             boundary_handle=str(entity.dxf.handle), boundary_layer=str(entity.dxf.layer),
             boundary=tuple(boundary), crop_bounds=(xmin, ymin, xmax, ymax),
             translate_x=dx, translate_y=dy, match_error=plan_error,
-            affine=tuple(affine)))
+            affine=tuple(affine), sheet_bounds=tuple(frame),
+            frame_handle=(str(frame_entity.dxf.handle) if frame_entity is not None else None)))
 
     geographic_controls = [
         (float(item["longitude"]), float(item["latitude"]))
@@ -483,6 +496,33 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
         crop = Polygon(boundary)
         if not crop.is_valid:
             crop = make_valid(crop)
+        # Environment plates cover a study radius much larger than the lease.
+        # Use the largest closed map outline inside the detected sheet frame
+        # (normally the 500 m boundary), while retaining the repeated lease
+        # outline as the survey-control alignment evidence.
+        if "environment" in str(plan.get("title", "")).casefold():
+            sheet_bounds = plan.get("sheet_bounds")
+            if sheet_bounds:
+                sheet_box = box(*sheet_bounds)
+                lease_envelope_area = max(1e-9, crop.envelope.area)
+                sheet_area = max(1e-9, sheet_box.area)
+                study_candidates = []
+                for source in records:
+                    geometry = source.get("geometry")
+                    if geometry is None or geometry.is_empty:
+                        continue
+                    geometry = force_2d(geometry)
+                    closed = geometry.geom_type == "Polygon" or (
+                        geometry.geom_type == "LineString" and geometry.is_ring)
+                    if not closed or not sheet_box.covers(geometry.representative_point()):
+                        continue
+                    envelope_area = geometry.envelope.area
+                    if lease_envelope_area * 2.0 <= envelope_area <= sheet_area * 0.90:
+                        study_candidates.append((envelope_area, geometry))
+                if study_candidates:
+                    crop = max(study_candidates, key=lambda item: item[0])[1]
+                    if not crop.is_valid:
+                        crop = make_valid(crop)
         crop = crop.buffer(margin, join_style="mitre")
         furniture_mask, furniture_handles = _sheet_furniture_mask(
             records, Polygon(boundary), crop, box)
@@ -491,6 +531,9 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
                 cancel.check()
             if not include_plan_boundary and str(source.get("entity_handle", "")) == \
                     str(plan.get("boundary_handle", "")):
+                continue
+            if not include_sheet_frame and plan.get("frame_handle") and \
+                    str(source.get("entity_handle", "")) == str(plan.get("frame_handle")):
                 continue
             if str(source.get("entity_handle", "")) in furniture_handles:
                 continue
@@ -538,7 +581,7 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
             if key not in seen:
                 seen.add(key)
                 aligned.append(record)
-        if not include_sheet_frame:
+        if not include_sheet_frame and not plan.get("frame_handle"):
             boundary_xmin = min(point[0] for point in boundary)
             boundary_ymin = min(point[1] for point in boundary)
             boundary_xmax = max(point[0] for point in boundary)

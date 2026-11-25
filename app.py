@@ -13,7 +13,10 @@ from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
 
 import converter
+import coordinate_controls
 import large_dxf
+import review_rules
+import semantic_layers
 from verify_dialog import VerifyPanel
 from vendor import cad_to_gis as cad
 
@@ -99,12 +102,13 @@ class App(tk.Tk):
         self.plan_margin = tk.StringVar(value="25")
         self.plan_summary = tk.StringVar(value="No repeated plan sheets detected yet.")
         self.detected_location = None
+        self.coordinate_control_report = None
         self.location_summary = tk.StringVar(value="No embedded latitude/longitude detected yet.")
         self.status = tk.StringVar(value="Ready. Load your DXF or try the synthetic demo.")
         self._styles()
         self._build()
         for variable in [self.crs, self.scale, self.rotation, self.offset_x, self.offset_y]:
-            variable.trace_add("write", lambda *_: self.location_ok.set(False))
+            variable.trace_add("write", self._coordinate_settings_changed)
         self.altitude.trace_add("write", lambda *_: self.height_ok.set(False))
         self.after(100, self._poll)
         self.protocol("WM_DELETE_WINDOW", self._close)
@@ -276,6 +280,15 @@ class App(tk.Tk):
         ttk.Checkbutton(left, text="I verified the source CRS and drawing units",
                         variable=self.location_ok).pack(anchor="w", pady=(1, 12))
 
+        self.control_button = ttk.Button(
+            left, text="Coordinate Control Wizard",
+            command=self._coordinate_control_wizard, state="disabled", style="Soft.TButton")
+        self.control_button.pack(fill="x", pady=(0, 7))
+        ttk.Label(
+            left,
+            text="Fit AutoCAD X/Y to matched survey latitude/longitude controls and inspect per-point error.",
+            wraplength=365, style="Muted.TLabel").pack(anchor="w", pady=(0, 10))
+
         ttk.Label(left, text="Detected map location", style="Title.TLabel").pack(anchor="w", pady=(2, 2))
         ttk.Label(left, textvariable=self.location_summary, wraplength=365,
                   style="Muted.TLabel").pack(anchor="w", pady=(1, 5))
@@ -327,6 +340,10 @@ class App(tk.Tk):
         bottom.pack(fill="x", padx=16, pady=(0, 0))
         self.preview_button = ttk.Button(bottom, text="Preview selected layers", command=self._preview)
         self.preview_button.pack(side="left")
+        self.review_button = ttk.Button(
+            bottom, text="Review categories", command=self._review_unclassified,
+            state="disabled", style="Soft.TButton")
+        self.review_button.pack(side="left", padx=(8, 0))
         self.export_button = ttk.Button(bottom, text="Export KML / KMZ", style="Accent.TButton", command=self._export)
         self.export_button.pack(side="left", padx=8)
         self.submission_button = ttk.Button(
@@ -391,7 +408,10 @@ class App(tk.Tk):
             dwg_converter=self.dwg.get(), location_confirmed=self.location_ok.get(),
             heights_confirmed=self.height_ok.get(),
             plan_ids=tuple(sorted(self.selected_plans)) if self.plan_mode.get() else None,
-            plan_margin=float(self.plan_margin.get()))
+            plan_margin=float(self.plan_margin.get()),
+            coordinate_control_json=(
+                json.dumps(self.coordinate_control_report, separators=(",", ":"), default=str)
+                if self.coordinate_control_report else ""))
 
     def _browse(self):
         if self.busy:
@@ -414,6 +434,9 @@ class App(tk.Tk):
         self.plan_mode.set(False)
         self.plan_button.configure(state="disabled")
         self.submission_button.configure(state="disabled")
+        self.review_button.configure(state="disabled")
+        self.control_button.configure(state="disabled")
+        self.coordinate_control_report = None
         self.plan_summary.set("Analysing repeated plan geometry...")
         self._set_detected_location(None)
         self.location_ok.set(False)
@@ -469,6 +492,8 @@ class App(tk.Tk):
                 self.submission_button.configure(state="disabled")
                 self.plan_summary.set(self.plan_info.get("reason") or "No repeated plan sheets detected.")
             self._render_layers()
+            self.review_button.configure(state="normal")
+            self.control_button.configure(state="normal")
             self._log(json.dumps(scan_result["files"], indent=2, default=str))
             self._log(json.dumps(self.plan_info, indent=2, default=str))
             self.status.set("Drawing analysed. Select layers, preview, and confirm the source CRS.")
@@ -812,6 +837,245 @@ class App(tk.Tk):
             self.crs_info.set("Source CRS could not be validated.")
             messagebox.showerror("Source coordinate system", str(exc))
 
+    def _coordinate_settings_changed(self, *_):
+        self.location_ok.set(False)
+        self.coordinate_control_report = None
+
+    def _coordinate_control_wizard(self):
+        if self.busy or not self.scanned_path:
+            return
+        dialog = tk.Toplevel(self)
+        dialog.title("Coordinate Control Wizard")
+        dialog.geometry("1180x780")
+        dialog.minsize(980, 680)
+        dialog.transient(self)
+
+        header = tk.Frame(dialog, bg=COLORS["header"], padx=20, pady=14)
+        header.pack(fill="x")
+        tk.Label(header, text="Coordinate Control Wizard", bg=COLORS["header"], fg="white",
+                 font=("Segoe UI Semibold", 17)).pack(anchor="w")
+        tk.Label(
+            header,
+            text="Match CAD coordinates to authoritative survey controls. Google imagery is not used as control data.",
+            bg=COLORS["header"], fg="#c6e1de", font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+
+        body = ttk.Frame(dialog, padding=14, style="Panel.TFrame")
+        body.pack(fill="both", expand=True)
+        panes = ttk.Panedwindow(body, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+        input_panel = ttk.Frame(panes, padding=10)
+        result_panel = ttk.Frame(panes, padding=10)
+        panes.add(input_panel, weight=1)
+        panes.add(result_panel, weight=2)
+
+        ttk.Label(input_panel, text="1. Matched control points", style="Title.TLabel").pack(anchor="w")
+        ttk.Label(
+            input_panel,
+            text=("One CSV row per matching pillar: name, CAD X, CAD Y, latitude, longitude. "
+                  "Latitude/longitude may be decimal degrees or quoted DMS."),
+            wraplength=400, style="Muted.TLabel").pack(anchor="w", pady=(3, 7))
+        editor_frame = ttk.Frame(input_panel)
+        editor_frame.pack(fill="both", expand=True)
+        editor = tk.Text(
+            editor_frame, wrap="none", bg="#f8fbfc", fg=COLORS["text"], relief="flat",
+            insertbackground=COLORS["accent"], padx=10, pady=10,
+            font=("Cascadia Mono", 9), undo=True)
+        editor_scroll_y = ttk.Scrollbar(editor_frame, orient="vertical", command=editor.yview)
+        editor_scroll_x = ttk.Scrollbar(editor_frame, orient="horizontal", command=editor.xview)
+        editor.configure(yscrollcommand=editor_scroll_y.set, xscrollcommand=editor_scroll_x.set)
+        editor_scroll_y.pack(side="right", fill="y")
+        editor_scroll_x.pack(side="bottom", fill="x")
+        editor.pack(fill="both", expand=True)
+
+        detected = coordinate_controls.detected_control_points(self.plan_info)
+        if detected:
+            editor.insert("1.0", coordinate_controls.controls_to_text(detected))
+        else:
+            editor.insert("1.0", "name,source_x,source_y,latitude,longitude\n")
+
+        input_actions = ttk.Frame(input_panel)
+        input_actions.pack(fill="x", pady=(7, 4))
+
+        def load_detected():
+            points = coordinate_controls.detected_control_points(self.plan_info)
+            if not points:
+                messagebox.showinfo(
+                    "Coordinate controls",
+                    "No complete GPS-labelled boundary was detected. Import the survey controls or enter them manually.",
+                    parent=dialog)
+                return
+            editor.delete("1.0", "end")
+            editor.insert("1.0", coordinate_controls.controls_to_text(points))
+
+        def import_csv():
+            path = filedialog.askopenfilename(
+                parent=dialog, title="Import matched survey controls",
+                filetypes=[("CSV files", "*.csv"), ("Text files", "*.txt"), ("All files", "*.*")])
+            if not path:
+                return
+            try:
+                content = Path(path).read_text(encoding="utf-8-sig")
+                coordinate_controls.parse_control_text(content)
+                editor.delete("1.0", "end")
+                editor.insert("1.0", content)
+            except Exception as exc:
+                messagebox.showerror("Import controls", str(exc), parent=dialog)
+
+        ttk.Button(input_actions, text="Use detected controls", command=load_detected).pack(side="left")
+        ttk.Button(input_actions, text="Import CSV", command=import_csv).pack(side="left", padx=6)
+
+        settings = ttk.Frame(input_panel)
+        settings.pack(fill="x", pady=(5, 0))
+        ttk.Label(settings, text="Projected target CRS:").grid(row=0, column=0, sticky="w")
+        initial_crs = self.plan_info.get("suggested_crs") or self.crs.get().strip() or "EPSG:32643"
+        target_crs = tk.StringVar(value=initial_crs)
+        ttk.Entry(settings, textvariable=target_crs, width=18).grid(
+            row=0, column=1, sticky="ew", padx=(8, 0))
+        use_holdout = tk.BooleanVar(value=len(detected) >= 4)
+        ttk.Checkbutton(
+            settings, text="Keep the last point as an independent verification point",
+            variable=use_holdout).grid(row=1, column=0, columnspan=2, sticky="w", pady=(6, 0))
+        settings.columnconfigure(1, weight=1)
+
+        ttk.Label(result_panel, text="2. Transformation and accuracy", style="Title.TLabel").pack(anchor="w")
+        result_summary = tk.StringVar(value="Enter matched controls, then calculate the fit.")
+        ttk.Label(result_panel, textvariable=result_summary, wraplength=680,
+                  style="Muted.TLabel").pack(fill="x", pady=(3, 8))
+        columns = ("name", "role", "expected", "calculated", "dx", "dy", "error")
+        tree = ttk.Treeview(result_panel, columns=columns, show="headings", height=15)
+        definitions = [
+            ("name", "Point", 65), ("role", "Role", 96),
+            ("expected", "Survey E / N", 180), ("calculated", "Calculated E / N", 180),
+            ("dx", "dE", 70), ("dy", "dN", 70), ("error", "Error", 75),
+        ]
+        for key, title, width in definitions:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, stretch=key in {"expected", "calculated"})
+        result_scroll = ttk.Scrollbar(result_panel, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=result_scroll.set)
+        result_scroll.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+        tree.tag_configure("pass", background="#effaf7")
+        tree.tag_configure("review", background="#fff8e8")
+        tree.tag_configure("fail", background="#fff1f0")
+        result_holder = [None]
+
+        def calculate():
+            try:
+                points = coordinate_controls.parse_control_text(editor.get("1.0", "end"))
+                holdout_index = len(points) - 1 if use_holdout.get() else None
+                report = coordinate_controls.solve(
+                    points, target_crs=target_crs.get().strip(), holdout_index=holdout_index)
+            except Exception as exc:
+                messagebox.showerror("Coordinate controls", str(exc), parent=dialog)
+                return
+            result_holder[0] = report
+            tree.delete(*tree.get_children())
+            for index, row in enumerate(report["controls"]):
+                error = float(row["error_metres"])
+                tag = "pass" if error <= 1 else "review" if error <= 5 else "fail"
+                tree.insert("", "end", iid=str(index), values=(
+                    row["name"], "VERIFY" if row["role"] == "independent_verification" else "FIT",
+                    f"{row['expected_x']:.3f}, {row['expected_y']:.3f}",
+                    f"{row['calculated_x']:.3f}, {row['calculated_y']:.3f}",
+                    f"{row['error_x_metres']:+.3f}", f"{row['error_y_metres']:+.3f}",
+                    f"{error:.3f} m"), tags=(tag,))
+            status = report["status"].upper()
+            holdout = report.get("holdout_error_metres")
+            precision = report.get("input_coordinate_precision_metres")
+            text = (
+                f"{status}  •  {report['target_crs']}  •  "
+                f"RMS {report['rms_error_metres']:.3f} m  •  "
+                f"Maximum fit {report['maximum_fit_error_metres']:.3f} m")
+            if holdout is not None:
+                text += f"  •  Independent check {holdout:.3f} m"
+            text += (f"\nScale {report['scale']:.10f}  •  "
+                     f"Rotation {report['rotation_degrees']:.8f}°  •  "
+                     f"Offset {report['offset_x']:.3f}, {report['offset_y']:.3f} m")
+            if precision:
+                text += f"\nWorst estimated coordinate-label precision: approximately {precision:.2f} m."
+            if report.get("area_difference_percent") is not None:
+                text += f"  Control-polygon area difference: {report['area_difference_percent']:.4f}%."
+            for note in report.get("quality_notes", ()):
+                text += f"\nReview: {note}"
+            outlier = report.get("suspected_outlier")
+            if outlier:
+                text += (f"\nPossible outlier: {outlier['name']} predicts "
+                         f"{outlier['predicted_error_metres']:.2f} m error. Review it; it was not excluded.")
+            result_summary.set(text)
+
+        def apply_result():
+            report = dict(result_holder[0] or {})
+            if not report:
+                messagebox.showinfo("Coordinate controls", "Calculate the fit first.", parent=dialog)
+                return
+            if report["status"] == "fail":
+                messagebox.showerror(
+                    "Coordinate controls",
+                    "This fit failed the accuracy limits and cannot be applied. Correct the point identities, values, datum, or CRS.",
+                    parent=dialog)
+                return
+            if report["status"] == "review" and not messagebox.askyesno(
+                    "Apply review-level calibration?",
+                    "This fit does not meet the strict pass limits. Apply it for survey-professional review?",
+                    parent=dialog):
+                return
+            matching_preset = next(
+                (name for name, value in PRESETS.items()
+                 if value and cad.CRS.from_user_input(value).equals(
+                     cad.CRS.from_user_input(report["target_crs"]))),
+                "Custom EPSG code or WKT")
+            applied = {
+                "scale": report["scale"],
+                "rotation_degrees": report["rotation_degrees"],
+                "offset_x": report["offset_x"],
+                "offset_y": report["offset_y"],
+            }
+            plans = list(self.plan_info.get("plans") or ())
+            if self.plan_mode.get() and plans and plans[0].get("affine"):
+                try:
+                    applied = coordinate_controls.correction_after_existing_affine(
+                        report, plans[0]["affine"])
+                except Exception as exc:
+                    messagebox.showerror("Coordinate controls", str(exc), parent=dialog)
+                    return
+                report["application_mode"] = "post_plan_alignment_correction"
+                report["existing_plan_alignment_affine"] = list(plans[0]["affine"])
+            else:
+                report["application_mode"] = "global_drawing_similarity"
+            report["applied_scale"] = applied["scale"]
+            report["applied_rotation_degrees"] = applied["rotation_degrees"]
+            report["applied_offset_x"] = applied["offset_x"]
+            report["applied_offset_y"] = applied["offset_y"]
+            self.preset.set(matching_preset)
+            self.crs.set(report["target_crs"])
+            self.scale.set(f"{applied['scale']:.15g}")
+            self.rotation.set(f"{applied['rotation_degrees']:.15g}")
+            self.offset_x.set(f"{applied['offset_x']:.15g}")
+            self.offset_y.set(f"{applied['offset_y']:.15g}")
+            # Variable traces deliberately clear stale calibration; assign the
+            # exact report only after every calculated setting has been applied.
+            self.coordinate_control_report = report
+            self.location_ok.set(False)
+            self._check_crs()
+            self.status.set(
+                f"Coordinate calibration applied ({report['status'].upper()}, RMS "
+                f"{report['rms_error_metres']:.3f} m). Verify the controls, then confirm the CRS.")
+            dialog.destroy()
+
+        footer = ttk.Frame(body, padding=(0, 10, 0, 0), style="Panel.TFrame")
+        footer.pack(fill="x")
+        ttk.Label(
+            footer,
+            text="PASS ≤0.5 m RMS and ≤1 m maximum. REVIEW ≤2 m RMS and ≤5 m maximum.",
+            style="Muted.TLabel").pack(side="left")
+        ttk.Button(footer, text="Close", command=dialog.destroy).pack(side="right")
+        ttk.Button(footer, text="Apply transformation", command=apply_result,
+                   style="Accent.TButton").pack(side="right", padx=7)
+        ttk.Button(footer, text="Calculate fit", command=calculate,
+                   style="Soft.TButton").pack(side="right")
+        dialog.grab_set()
+
     def _preview(self):
         if self.busy:
             return
@@ -826,6 +1090,293 @@ class App(tk.Tk):
             self.tabs.select(0)
             self.status.set("Drawing preview ready. It uses source coordinates, not geographic placement.")
         self._run(lambda token, log, progress: converter.preview(options, cancel=token, log=log, progress=progress), done)
+
+    def _review_unclassified(self):
+        if self.busy:
+            return
+        try:
+            options = self._collect_options()
+            converter.job_for(options)
+        except Exception as exc:
+            messagebox.showerror("Classification review", str(exc))
+            return
+
+        def done(result):
+            self.status.set(
+                f"Classification review ready: {len(result['unclassified']):,} item(s) need a decision.")
+            self._open_review_dialog(result, options)
+
+        self._run(
+            lambda token, log, progress: converter.prepare_semantic_review(
+                options, cancel=token, log=log, progress=progress),
+            done)
+
+    def _open_review_dialog(self, result, options):
+        unclassified = list(result.get("unclassified", ()))
+        if not unclassified:
+            messagebox.showinfo(
+                "Classification review",
+                "All extracted objects are classified. No manual decisions are required.")
+            return
+
+        dialog = tk.Toplevel(self)
+        dialog.title("Review unclassified drawing objects")
+        dialog.geometry("1180x760")
+        dialog.minsize(940, 620)
+        dialog.transient(self)
+
+        header = tk.Frame(dialog, bg=COLORS["header"], padx=20, pady=14)
+        header.pack(fill="x")
+        tk.Label(header, text="Classification review", bg=COLORS["header"], fg="white",
+                 font=("Segoe UI Semibold", 17)).pack(anchor="w")
+        tk.Label(
+            header,
+            text="Assign uncertain CAD objects to a government-review folder. Decisions stay local and apply only while this exact drawing is unchanged.",
+            bg=COLORS["header"], fg="#c6e1de", font=("Segoe UI", 9)).pack(anchor="w", pady=(2, 0))
+
+        body = ttk.Frame(dialog, padding=14, style="Panel.TFrame")
+        body.pack(fill="both", expand=True)
+        summary_text = tk.StringVar()
+        ttk.Label(body, textvariable=summary_text, style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+        panes = ttk.Panedwindow(body, orient="horizontal")
+        panes.pack(fill="both", expand=True)
+
+        list_panel = ttk.Frame(panes, padding=8)
+        preview_panel = ttk.Frame(panes, padding=8)
+        panes.add(list_panel, weight=1)
+        panes.add(preview_panel, weight=2)
+
+        columns = ("plan", "type", "layer", "style", "value")
+        tree = ttk.Treeview(list_panel, columns=columns, show="headings", selectmode="browse")
+        headings = [
+            ("plan", "Plan", 130), ("type", "Object", 78),
+            ("layer", "Original layer", 145), ("style", "Color / line", 115),
+            ("value", "Text / handle", 170),
+        ]
+        for key, title, width in headings:
+            tree.heading(key, text=title)
+            tree.column(key, width=width, stretch=key in {"plan", "layer", "value"})
+        tree_scroll = ttk.Scrollbar(list_panel, orient="vertical", command=tree.yview)
+        tree.configure(yscrollcommand=tree_scroll.set)
+        tree_scroll.pack(side="right", fill="y")
+        tree.pack(fill="both", expand=True)
+
+        review_preview = DrawingPreview(preview_panel)
+        review_preview.pack(fill="both", expand=True)
+        detail = tk.StringVar(value="Select an object to inspect it.")
+        ttk.Label(preview_panel, textvariable=detail, wraplength=650,
+                  style="Muted.TLabel").pack(fill="x", pady=(4, 8))
+
+        decision = ttk.Frame(preview_panel)
+        decision.pack(fill="x")
+        ttk.Label(decision, text="Assign folder:").grid(row=0, column=0, sticky="w")
+        categories = sorted(set(semantic_layers.available_categories()) |
+                            set(result.get("summary", {}).get("allowed_legend_categories", ())))
+        category = tk.StringVar(value=categories[0] if categories else "LEASE BOUNDARY")
+        category_box = ttk.Combobox(
+            decision, textvariable=category, values=categories, state="readonly", width=34)
+        category_box.grid(row=0, column=1, sticky="ew", padx=(8, 0))
+        scope = tk.StringVar(value="entity")
+        ttk.Radiobutton(
+            decision, text="Only this object", variable=scope, value="entity").grid(
+                row=1, column=1, sticky="w", pady=(7, 0))
+        ttk.Radiobutton(
+            decision, text="All matching objects in this plan and CAD layer",
+            variable=scope, value="style").grid(row=2, column=1, sticky="w")
+        decision.columnconfigure(1, weight=1)
+
+        record_by_iid = {}
+        all_records = list(result.get("records", ()))
+        saved_rule_identities = {
+            json.dumps(rule, sort_keys=True, default=str)
+            for rule in result.get("rules", ())
+        }
+        ambiguous_styles = {
+            tuple(item.get("signature") or ()): item.get("votes") or {}
+            for item in (result.get("summary", {}).get("source_legend") or {}).get(
+                "ambiguous_styles", ())
+        }
+
+        def label_value(record):
+            value = " ".join(str(record.get("text_value") or "").split())
+            return (value[:55] if value else str(record.get("entity_handle") or "—"))
+
+        def review_reason(record):
+            signature = semantic_layers.style_signature(record)
+            votes = ambiguous_styles.get(tuple(signature))
+            if votes:
+                choices = ", ".join(
+                    f"{name} ({count})" for name, count in
+                    sorted(votes.items(), key=lambda item: (-item[1], item[0])))
+                return "This style has multiple meanings in the drawing legend: " + choices
+            layer = str(record.get("original_cad_layer") or record.get("cad_layer") or "0")
+            if layer.strip() == "0":
+                return "The object is on generic AutoCAD layer 0 and has no unique legend/style match."
+            if record.get("block_name"):
+                return f"Block '{record['block_name']}' has no recognised semantic name or attribute."
+            if record.get("text_value"):
+                return "The text is an annotation/value, but it does not uniquely identify a feature category."
+            return "No explicit layer, named block, unique legend style, or safe local relationship was found."
+
+        def insert_records():
+            tree.delete(*tree.get_children())
+            record_by_iid.clear()
+            for index, record in enumerate(unclassified):
+                iid = str(index)
+                record_by_iid[iid] = record
+                signature = semantic_layers.style_signature(record)
+                tree.insert("", "end", iid=iid, values=(
+                    record.get("plan_title") or "Drawing",
+                    record.get("entity_type") or "—",
+                    record.get("original_cad_layer") or record.get("cad_layer") or "0",
+                    f"{signature[1] or 'BYLAYER'} / {signature[2]}",
+                    label_value(record)))
+
+        def update_summary():
+            classified = int(result.get("summary", {}).get("classified_records", 0))
+            summary_text.set(
+                f"{len(tree.get_children()):,} uncertain objects remaining  •  "
+                f"{classified:,} automatically classified  •  "
+                f"{len(saved_rule_identities):,} saved decisions")
+
+        def preview_record(_event=None):
+            selected = tree.selection()
+            if not selected:
+                review_preview.set_features([])
+                return
+            record = record_by_iid[selected[0]]
+            geometry = record.get("geometry")
+            features = []
+            if geometry is not None and not geometry.is_empty:
+                all_bounds = [candidate["geometry"].bounds for candidate in all_records
+                              if candidate.get("geometry") is not None
+                              and not candidate["geometry"].is_empty]
+                if all_bounds:
+                    width = max(value[2] for value in all_bounds) - min(value[0] for value in all_bounds)
+                    height = max(value[3] for value in all_bounds) - min(value[1] for value in all_bounds)
+                    radius = max(width, height) * 0.025
+                    region = geometry.envelope.buffer(max(radius, 1e-9))
+                    for candidate in all_records:
+                        candidate_geometry = candidate.get("geometry")
+                        if candidate_geometry is not None and not candidate_geometry.is_empty \
+                                and candidate_geometry.intersects(region):
+                            features.append({
+                                "geometry": candidate_geometry,
+                                "layer": "Nearby context",
+                                "entity_type": candidate.get("entity_type"),
+                                "entity_handle": candidate.get("entity_handle"),
+                            })
+                            if len(features) >= 250:
+                                break
+                features.append({
+                    "geometry": geometry, "layer": "SELECTED OBJECT",
+                    "entity_type": record.get("entity_type"),
+                    "entity_handle": record.get("entity_handle"),
+                })
+            review_preview.set_features(features)
+            signature = semantic_layers.style_signature(record)
+            detail.set(
+                f"Plan: {record.get('plan_title') or 'Drawing'}   •   "
+                f"Handle: {record.get('entity_handle') or 'none'}   •   "
+                f"Type: {record.get('entity_type') or 'unknown'}\n"
+                f"CAD layer: {record.get('original_cad_layer') or record.get('cad_layer') or '0'}   •   "
+                f"Style: {signature[0]}, {signature[1] or 'BYLAYER'}, {signature[2]}   •   "
+                f"Text: {label_value(record)}\nWhy review: {review_reason(record)}")
+
+        def save_decision():
+            selected = tree.selection()
+            if not selected:
+                messagebox.showinfo("Classification review", "Select an object first.", parent=dialog)
+                return
+            record = record_by_iid[selected[0]]
+            chosen = category.get().strip()
+            if not chosen:
+                return
+            selected_scope = scope.get()
+            handle = str(record.get("entity_handle") or "")
+            if selected_scope == "entity" and not handle:
+                messagebox.showerror(
+                    "Classification review",
+                    "This object has no stable CAD handle. Use the matching-style option instead.",
+                    parent=dialog)
+                return
+            rule = {
+                "scope": selected_scope,
+                "plan_id": str(record.get("plan_id") or ""),
+                "category": chosen,
+            }
+            if selected_scope == "entity":
+                rule["entity_handle"] = handle
+            else:
+                rule["signature"] = list(semantic_layers.style_signature(record))
+                rule["original_layer"] = str(
+                    record.get("original_cad_layer") or record.get("cad_layer") or "0")
+            review_rules.add_rule(options.input_path, rule)
+            identity_fields = ("scope", "plan_id", "entity_handle", "signature", "original_layer")
+            identity = tuple(json.dumps(rule.get(field), sort_keys=True)
+                             for field in identity_fields)
+            for existing in list(saved_rule_identities):
+                try:
+                    parsed = json.loads(existing)
+                except (TypeError, ValueError):
+                    continue
+                existing_identity = tuple(json.dumps(parsed.get(field), sort_keys=True)
+                                          for field in identity_fields)
+                if existing_identity == identity:
+                    saved_rule_identities.discard(existing)
+            saved_rule_identities.add(json.dumps(rule, sort_keys=True, default=str))
+
+            def matched(candidate):
+                if str(candidate.get("plan_id") or "") != rule["plan_id"]:
+                    return False
+                if selected_scope == "entity":
+                    return str(candidate.get("entity_handle") or "") == handle
+                return (list(semantic_layers.style_signature(candidate)) == rule["signature"] and
+                        str(candidate.get("original_cad_layer") or candidate.get("cad_layer") or "0") ==
+                        rule["original_layer"])
+
+            for iid in list(tree.get_children()):
+                if matched(record_by_iid[iid]):
+                    tree.delete(iid)
+            update_summary()
+            remaining = tree.get_children()
+            if remaining:
+                tree.selection_set(remaining[0])
+                tree.focus(remaining[0])
+                preview_record()
+            else:
+                review_preview.set_features([])
+                detail.set("All uncertain objects in this review have a saved decision. Reanalyse to verify the result.")
+
+        def clear_saved():
+            if messagebox.askyesno(
+                    "Clear saved decisions?",
+                    "Remove all manual category decisions for this drawing?",
+                    parent=dialog):
+                review_rules.clear_rules(options.input_path)
+                dialog.destroy()
+                self.after_idle(self._review_unclassified)
+
+        def reanalyse():
+            dialog.destroy()
+            self.after_idle(self._review_unclassified)
+
+        tree.bind("<<TreeviewSelect>>", preview_record)
+        insert_records()
+        update_summary()
+        actions = ttk.Frame(body, padding=(0, 10, 0, 0), style="Panel.TFrame")
+        actions.pack(fill="x")
+        ttk.Button(actions, text="Clear saved decisions", command=clear_saved,
+                   style="Danger.TButton").pack(side="left")
+        ttk.Button(actions, text="Close", command=dialog.destroy).pack(side="right")
+        ttk.Button(actions, text="Reanalyse drawing", command=reanalyse).pack(side="right", padx=7)
+        ttk.Button(actions, text="Save decision", command=save_decision,
+                   style="Accent.TButton").pack(side="right")
+        first = tree.get_children()[0]
+        tree.selection_set(first)
+        tree.focus(first)
+        preview_record()
+        dialog.grab_set()
 
     def _export(self):
         if self.busy:
@@ -865,6 +1416,21 @@ class App(tk.Tk):
         lines = ["EXPORT READY", "", result["output"], "", f"Features: {data['features_exported']}",
                  f"Altitude mode: {data['altitude_mode']}", "", "LAYERS"]
         lines += [f"  {name}: {count}" for name, count in data["layer_counts"].items()]
+        controls = report.get("coordinate_control")
+        if controls:
+            lines += [
+                "", "COORDINATE CONTROL",
+                f"Status: {str(controls.get('status', 'review')).upper()}",
+                f"Projected CRS: {controls.get('target_crs', '')}",
+                f"Matched controls: {controls.get('point_count', 0)}",
+                f"RMS fit error: {float(controls.get('rms_error_metres', 0)):.3f} m",
+                f"Maximum fit error: {float(controls.get('maximum_fit_error_metres', 0)):.3f} m",
+            ]
+            if controls.get("holdout_error_metres") is not None:
+                lines.append(
+                    f"Independent verification error: {float(controls['holdout_error_metres']):.3f} m")
+            lines.append(
+                f"Application: {controls.get('application_mode', 'global_drawing_similarity')}")
         semantic = report.get("semantic_classification")
         if semantic:
             lines += [
@@ -872,8 +1438,9 @@ class App(tk.Tk):
                 f"Recognised legend folders: {len(semantic.get('allowed_legend_categories', []))}",
                 f"Matched to legend folders: {semantic.get('classified_records', 0)}",
                 f"Unclassified - review required: {semantic.get('unclassified_records', 0)}",
-                "Policy: explicit CAD layer or unambiguous style from this drawing only.",
-                "Nearby text is never used to guess a folder.",
+                f"Saved review decisions applied: {semantic.get('manual_rules_loaded', 0)}",
+                "Policy: file-local legend, constrained geometry rules, and saved human review.",
+                "Uncertain objects remain unclassified until a reviewer decides.",
             ]
         b = data["wgs84_bounds"]
         lines += ["", f"Longitude: {b[0]:.7f} to {b[2]:.7f}", f"Latitude:  {b[1]:.7f} to {b[3]:.7f}",
@@ -1009,7 +1576,7 @@ class App(tk.Tk):
         self.progressbar["value"] = 0
         for button in [self.browse_button, self.scan_button, self.demo_button,
                        self.preview_button, self.export_button, self.submission_button,
-                       self.plan_button]:
+                       self.plan_button, self.review_button, self.control_button]:
             button.configure(state="disabled")
         self.file_entry.configure(state="disabled")
         self.cancel_button.configure(state="normal")
@@ -1031,6 +1598,10 @@ class App(tk.Tk):
         for button in [self.browse_button, self.scan_button, self.demo_button,
                        self.preview_button, self.export_button]:
             button.configure(state="normal")
+        self.review_button.configure(
+            state="normal" if self.scanned_path else "disabled")
+        self.control_button.configure(
+            state="normal" if self.scanned_path else "disabled")
         self.plan_button.configure(state="normal" if self.plan_info.get("available") else "disabled")
         self.submission_button.configure(
             state="normal" if self.plan_info.get("available") else "disabled")

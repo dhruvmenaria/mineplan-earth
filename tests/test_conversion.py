@@ -33,6 +33,10 @@ def test_ground_export_preserves_layers_geometry_and_known_survey_point(demo, tm
     assert any(abs(p[0] - 73.7) < 1e-8 and abs(p[1] - 24.58) < 1e-8 for p in coords)
     assert {v.text for v in root.findall('.//k:altitudeMode', N)} == {'clampToGround'}
     assert json.loads(Path(result['report_path']).read_text())['mineplan_earth']['features_exported'] == 5
+    roundtrip = result['report']['coordinate_roundtrip']
+    assert roundtrip['status'] == 'pass'
+    assert roundtrip['samples'] > 0
+    assert roundtrip['maximum_residual_metres'] < .01
 
 
 def test_kmz_layer_selection_and_absolute_heights(demo, tmp_path):
@@ -144,6 +148,10 @@ def test_repeated_plan_sheets_are_clipped_aligned_and_grouped(tmp_path):
     assert len(detection['plans']) == 2
     assert detection['control_match_error'] < 1e-7
 
+    with pytest.raises(ValueError, match='side-by-side plan sheets'):
+        c.convert(c.Options(str(path), source_crs='EPSG:4326', location_confirmed=True,
+                            plan_margin=.02), tmp_path / 'unsafe-ordinary-export.kml')
+
     ids = tuple(p['id'] for p in detection['plans'])
     opts = c.Options(str(path), source_crs='EPSG:4326', location_confirmed=True,
                      plan_ids=ids, plan_margin=.02)
@@ -180,6 +188,21 @@ def test_repeated_plan_sheets_are_clipped_aligned_and_grouped(tmp_path):
         'detected_plan_boundary_excluded'] is True
     assert without_frames['report']['plan_sheet_alignment'][
         'oversized_sheet_frame_excluded'] is True
+
+
+def test_polygon_area_and_perimeter_are_written_to_kml_and_report(demo, tmp_path):
+    result = c.convert(options(demo), tmp_path / 'measured.kml')
+    root = ET.parse(result['output']).getroot()
+    values = {
+        node.attrib['name']: node.find('k:value', N).text
+        for node in root.findall('.//k:Placemark[1]/k:ExtendedData/k:Data', N)
+    }
+    assert float(values['area_square_metres']) > 0
+    assert float(values['area_hectares']) > 0
+    assert float(values['perimeter_metres']) > 0
+    summary = result['report']['mineplan_earth']
+    assert summary['polygon_area_hectares_by_layer']['Lease Boundary'] > 0
+    assert summary['polygon_perimeter_metres_by_layer']['Lease Boundary'] > 0
 
 
 def test_multi_vertex_plan_uses_embedded_gps_labels(tmp_path):
@@ -241,3 +264,26 @@ def test_bare_two_line_dms_labels_with_corrupt_degree_symbol_are_parsed():
     assert abs(coordinates[0][1] - (27 + 8 / 60 + 1.6 / 3600)) < 1e-10
     assert abs(coordinates[0][0] - (73 + 22 / 60 + 41.57 / 3600)) < 1e-10
     assert abs(coordinates[1][1] - (27 + 8 / 60 + .03 / 3600)) < 1e-10
+
+
+def test_environment_plate_accepts_millimetre_copy_drift_and_typo(tmp_path):
+    path = tmp_path / "environment_copy.dxf"
+    doc = ezdxf.new()
+    model = doc.modelspace()
+    shape = [(0, 0), (100, 0), (100, 80), (0, 80)]
+    first = [(x + 1000, y + 1000) for x, y in shape]
+    second = [(x + 2000, y + 1000) for x, y in shape]
+    second[2] = (second[2][0], second[2][1] + .001)
+    model.add_lwpolyline(first, close=True)
+    model.add_lwpolyline(second, close=True)
+    for point in first:
+        model.add_point(point)
+    model.add_lwpolyline([(1900, 900), (2400, 900), (2400, 1300), (1900, 1300)], close=True)
+    model.add_mtext("ENVIROMENT PLAN OF M.L. NO.- 1", dxfattribs={"insert": (2300, 950)})
+    doc.saveas(path)
+
+    detection = c.analyze_plan_sheets(c.Options(str(path)))
+    assert detection["available"] is True
+    assert len(detection["plans"]) == 2
+    assert detection["plans"][1]["title"] == "Environment Plan"
+    assert detection["plans"][1]["sheet_bounds"] == pytest.approx((1900, 900, 2400, 1300))
