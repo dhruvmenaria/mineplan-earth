@@ -1210,6 +1210,11 @@ class DXFExtractor:
             "source_order": self.source_order,
         }
         data.update(self._resolve_style(entity, layer, context))
+        if entity.dxftype() in {"HATCH", "MPOLYGON"}:
+            data["hatch_pattern"] = str(getattr(entity.dxf, "pattern_name", "") or "").upper()
+            data["hatch_angle"] = float(getattr(entity.dxf, "pattern_angle", 0) or 0)
+            data["hatch_scale"] = float(getattr(entity.dxf, "pattern_scale", 1) or 1)
+            data["hatch_solid"] = bool(getattr(entity.dxf, "solid_fill", 0))
         data.update(extra)
         return data
 

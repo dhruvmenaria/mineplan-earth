@@ -251,3 +251,122 @@ def test_repeated_aligned_geometry_propagates_only_unique_category():
     result, _ = semantic_layers.classify_records([explicit, unknown])
     assert result[1]["semantic_category"] == "EXIST. ROAD"
     assert result[1]["classification_method"] == "repeated_aligned_geometry"
+
+
+def test_legend_names_remain_local_to_each_plate():
+    first = _record("LINE", LineString([(0, 0), (5, 0)]), layer="PROP. PLANTATION")
+    second = dict(first, plan_id="year2", plan_title="Year 2")
+    first.update(plan_id="year1", plan_title="Year 1")
+    observations = [
+        {"plan_id": "year1", "category": "PROP. PLANTATION", "label": "PROP. Ist YEAR PLANTATION",
+         "signature": semantic_layers.style_signature(first), "pairing_confidence": "HIGH"},
+        {"plan_id": "year2", "category": "PROP. PLANTATION", "label": "PROP. IInd YEAR PLANTATION",
+         "signature": semantic_layers.style_signature(second), "pairing_confidence": "HIGH"},
+    ]
+    result, summary = semantic_layers.classify_records([first, second], legend_report={"observations": observations})
+    assert result[0]["cad_layer"] == "Year 1 / PROP. Ist YEAR PLANTATION"
+    assert result[1]["cad_layer"] == "Year 2 / PROP. IInd YEAR PLANTATION"
+    assert all(row["matched_records"] == 1 for row in summary["legend_coverage"])
+
+
+def test_index_region_preserves_unusual_terms_and_excludes_map_notes():
+    doc = ezdxf.new()
+    model = doc.modelspace()
+    for text, x, y in [("INDEX", 100, 100), ("LEASE BOUNDARY", 110, 90),
+                        ("CONTOUR", 110, 80), ("PEGMATITE BODY", 110, 70),
+                        ("WELL", 20, 90)]:
+        model.add_text(text, dxfattribs={"height": 2, "insert": (x, y)})
+    for y, color in [(90, 1), (80, 2), (70, 3)]:
+        model.add_line((100, y), (106, y), dxfattribs={"color": color})
+    model.add_circle((15, 90), 1, dxfattribs={"color": 5})
+    _, report = semantic_layers.learn_legend_styles_from_document(doc)
+    names = {row["label"] for row in report["observations"]}
+    assert "PEGMATITE BODY" in names
+    assert "WELL" not in names
+    assert all("pairing_confidence" in row for row in report["observations"])
+
+
+def test_same_colour_hatches_use_pattern_and_reject_ambiguous_matches():
+    hatch = _record("HATCH", Polygon([(0, 0), (2, 0), (2, 2), (0, 2)]))
+    hatch.update(plan_id="p1", hatch_pattern="CROSS", hatch_angle=0)
+    rows = [
+        {"plan_id": "p1", "category": "EXIST. DUMP", "signature": ["AREA", "#FF0000", "CONTINUOUS"],
+         "hatch_pattern": "CROSS", "hatch_angle": 0, "pairing_confidence": "HIGH"},
+        {"plan_id": "p1", "category": "SOIL", "signature": ["AREA", "#FF0000", "CONTINUOUS"],
+         "hatch_pattern": "ANSI31", "hatch_angle": 0, "pairing_confidence": "HIGH"},
+    ]
+    category, method = semantic_layers.detailed_legend_match(hatch, rows)
+    assert (category, method) == ("EXIST. DUMP", "plate_legend_hatch_pattern")
+    rows.append(dict(rows[0], category="SOIL"))
+    assert semantic_layers.detailed_legend_match(hatch, rows) == (None, None)
+    assert semantic_layers.detailed_legend_match(dict(hatch, plan_id="other"), rows) == (None, None)
+
+
+def test_anonymous_block_uses_same_plate_legend_identity():
+    record = _record("LINE", LineString([(0, 0), (1, 0)]))
+    record.update(plan_id="p1", block_name="*U15")
+    rows = [{"plan_id": "p1", "block_name": "*U15", "category": "TREE",
+             "pairing_confidence": "HIGH"}]
+    assert semantic_layers.detailed_legend_match(record, rows)[0] == "TREE"
+    assert semantic_layers.detailed_legend_match(dict(record, block_name="*U16"), rows) == (None, None)
+
+
+def test_valid_gps_text_is_source_coordinate_annotation():
+    assert semantic_layers.category_for_text('N26°44\'56.2" E75°13\'37.99"') == "GEO COORDINATES"
+    assert semantic_layers.category_for_text('N26°70\'56.2" E75°13\'37.99"') is None
+
+
+def test_pit_propagation_requires_whole_geometry_inside():
+    pit = _record("LWPOLYLINE", Polygon([(0, 0), (10, 0), (10, 10), (0, 10)]), layer="EXIST. PIT")
+    crossing = _record("LINE", LineString([(-5, 5), (5, 5)]), color="#123456")
+    result, _ = semantic_layers.classify_records([pit, crossing])
+    assert result[1]["semantic_category"] == "UNCLASSIFIED - REVIEW"
+
+
+def test_horizontal_year_key_is_detected_and_preserves_role_review():
+    doc = ezdxf.new()
+    model = doc.modelspace()
+    model.add_text("PROP. YEAR WISE WORKING", dxfattribs={"insert": (100, 100), "height": 2})
+    model.add_text("II", dxfattribs={"insert": (101, 95), "height": 2})
+    model.add_lwpolyline([(99, 93), (106, 93), (106, 97), (99, 97)], close=True,
+                         dxfattribs={"color": 5})
+    detection = {"plans": [{"id": "year2", "sheet_bounds": (0, 0, 200, 200)}]}
+    _, report = semantic_layers.learn_legend_styles_from_document(doc, plan_detection=detection)
+    assert report["year_colour_keys"][0]["year"] == "II"
+    line = _record("LINE", LineString([(0, 0), (5, 0)]), color="#0000FF")
+    line.update(plan_id="year2", entity_handle="A1")
+    result, summary = semantic_layers.classify_records([line], legend_report=report)
+    assert result[0]["source_year"] == "II"
+    assert result[0]["feature_role_review_required"] is True
+    assert summary["feature_role_review_records"] == 1
+    reviewed, _ = semantic_layers.classify_records([line], legend_report=report, manual_rules=[{
+        "scope": "entity", "plan_id": "year2", "entity_handle": "A1", "category": "PROP. PIT"}])
+    assert reviewed[0]["semantic_category"] == "PROP. PIT"
+    assert reviewed[0]["feature_role_review_required"] is False
+
+
+def test_section_and_grid_lines_require_endpoint_evidence():
+    section = _record("LINE", LineString([(0, 0), (30, 0)]), color="#123456")
+    grid = _record("LINE", LineString([(0, 20), (30, 20)]), color="#123456")
+    unrelated = _record("LINE", LineString([(50, 0), (80, 0)]), color="#123456")
+    labels = [_record("TEXT", Point(0, 0), text="Y"),
+              _record("TEXT", Point(30, 0), text="Y'"),
+              _record("TEXT", Point(0, 20), text="0N"),
+              _record("TEXT", Point(30, 20), text="100E")]
+    result, _ = semantic_layers.classify_records([section, grid, unrelated, *labels])
+    assert result[0]["semantic_category"] == "SECTION LINE"
+    assert result[1]["semantic_category"] == "GRID LINE"
+    assert result[2]["semantic_category"] == "UNCLASSIFIED - REVIEW"
+
+
+def test_year_dump_label_uses_word_order_seen_in_real_drawings():
+    assert semantic_layers.category_for_text("PROP II YEAR REJECT DUMP MRL-445") == "PROP. MINERAL REJECT DUMP"
+    assert semantic_layers.category_for_text("PROP V YEAR MINERAL DUMP MRL-445") == "PROP. MINERAL REJECT DUMP"
+
+
+def test_detected_frame_does_not_get_claimed_by_a_feature_label():
+    frame = _record("LWPOLYLINE", Polygon([(0, 0), (100, 0), (100, 100), (0, 100)]))
+    frame["detected_sheet_frame"] = True
+    label = _record("TEXT", Point(50, 50), text="PROP II YEAR REJECT DUMP MRL-445")
+    result, _ = semantic_layers.classify_records([frame, label])
+    assert result[0]["semantic_category"] == "DRAWING FRAME"

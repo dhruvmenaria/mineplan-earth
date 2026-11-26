@@ -106,9 +106,9 @@ def _gps_coordinates(texts):
     pairs = []
     seen = set()
     for _, _, value in texts:
-        text = value.upper().replace("�", "°").replace("º", "°")
-        north = re.search(r"N\s*(\d{1,2})\D+(\d{1,2})\D+(\d+(?:\.\d+)?)", text)
-        east = re.search(r"E\s*(\d{1,3})\D+(\d{1,2})\D+(\d+(?:\.\d+)?)", text)
+        text = value.upper().replace("Â°", "°").replace("�", "°").replace("º", "°")
+        north = re.search(r"\bN\s*(\d{1,2})\s*°\s*(\d{1,2})\s*['’′]\s*(\d+(?:\.\d+)?)", text)
+        east = re.search(r"\bE\s*(\d{1,3})\s*°\s*(\d{1,2})\s*['’′]\s*(\d+(?:\.\d+)?)", text)
         if north and east:
             latitude = tuple(float(north.group(i)) for i in range(1, 4))
             longitude = tuple(float(east.group(i)) for i in range(1, 4))
@@ -128,6 +128,8 @@ def _gps_coordinates(texts):
             continue
         lat = latitude[0] + latitude[1] / 60 + latitude[2] / 3600
         lon = longitude[0] + longitude[1] / 60 + longitude[2] / 3600
+        if not (8 <= lat <= 38 and 68 <= lon <= 98):
+            continue
         key = (round(lat, 8), round(lon, 8))
         if key not in seen:
             seen.add(key)
@@ -471,6 +473,11 @@ def detect(path, *, margin=25.0):
         "location": location,
         "duplicate_boundary_entities": duplicate_count,
         "drawing_units_code": int(doc.header.get("$INSUNITS", 0) or 0),
+        "fit_diagnostics": ({
+            "scale": first_fit[3], "rotation_degrees": first_fit[4],
+            "maximum_error_metres": first_fit[2],
+            "review_required": abs(first_fit[3] - 1) > 0.001 or abs(first_fit[4]) > 1,
+        } if alignment_kind == "gps_similarity" else {}),
     }
 
 
@@ -569,6 +576,8 @@ def align_records(records, detection, selected_ids, *, margin=25.0, cancel=None,
             record["plan_id"] = plan["id"]
             record["plan_title"] = plan["title"]
             record["geometry"] = moved
+            record["detected_lease_boundary"] = str(source.get("entity_handle", "")) == str(plan.get("boundary_handle", ""))
+            record["detected_sheet_frame"] = bool(plan.get("frame_handle")) and str(source.get("entity_handle", "")) == str(plan["frame_handle"])
             # The source contains exact duplicate outlines.  Remove only exact,
             # same-layer duplicates after clipping/alignment.
             # AutoCAD frequently stores the same visible object more than once
@@ -676,6 +685,7 @@ def _consolidate_shared_features(records, plans):
     """
     from collections import defaultdict
     from shapely import force_2d, normalize, set_precision
+    from semantic_layers import category_for_layer
 
     if len(plans) < 2:
         return records
@@ -685,15 +695,19 @@ def _consolidate_shared_features(records, plans):
         if geometry is None or geometry.is_empty:
             continue
         original_layer = str(record.get("cad_layer") or "0").split(" / ", 1)[-1]
+        static_categories = {"LEASE BOUNDARY", "CONTOUR", "EXIST. ROAD", "Boundary pillars", "GEO COORDINATES", "BENCH MARK"}
+        if not record.get("detected_lease_boundary") and category_for_layer(original_layer) not in static_categories and original_layer.upper() != "ROAD":
+            continue
         text = str(record.get("text_value") or "").strip().casefold()
         canonical = normalize(set_precision(force_2d(geometry), 0.001))
-        groups[(original_layer.casefold(), text, canonical.wkb)].append(index)
+        style = (record.get("color_hex"), record.get("linetype"), record.get("hatch_pattern"), record.get("hatch_angle"))
+        groups[(original_layer.casefold(), text, style, canonical.wkb)].append(index)
 
     removed = set()
     shared = []
     for indexes in groups.values():
         plan_ids = {str(records[index].get("plan_id") or "") for index in indexes}
-        if len(plan_ids) < 2:
+        if plan_ids != {str(plan["id"]) for plan in plans}:
             continue
         preferred = min(indexes)
         record = dict(records[preferred])

@@ -350,6 +350,8 @@ class App(tk.Tk):
             bottom, text="Government submission folder",
             command=self._export_submission, state="disabled", style="Soft.TButton")
         self.submission_button.pack(side="left")
+        ttk.Button(bottom, text="Grouped large export", command=self._export_grouped,
+                   style="Soft.TButton").pack(side="left", padx=5)
         self.open_button = ttk.Button(bottom, text="Open last export", command=self._open_export, state="disabled")
         self.open_button.pack(side="left", padx=8)
         self.cancel_button = ttk.Button(bottom, text="Cancel", command=self._cancel,
@@ -657,6 +659,35 @@ class App(tk.Tk):
         ttk.Button(controls, text="Create working DXF", command=create,
                    style="Accent.TButton").pack(side="right")
         dialog.grab_set()
+
+    def _export_grouped(self):
+        if self.busy:
+            return
+        try:
+            options = self._collect_options(selected=False)
+            converter.job_for(options, export=True)
+            if Path(options.input_path).suffix.lower() != ".dxf":
+                raise ValueError("Grouped export requires an ASCII DXF.")
+        except Exception as exc:
+            messagebox.showerror("Grouped export", str(exc), parent=self)
+            return
+        folder = filedialog.askdirectory(title="Choose a new grouped-export destination")
+        if not folder:
+            return
+        import grouped_export
+        government = messagebox.askyesnocancel(
+            "Grouped export purpose",
+            "Create a government plate package?\n\nYes: exclude contour/topography bulk before conversion.\nNo: include bulk parts for internal review.", parent=self)
+        if government is None:
+            return
+        def done(result):
+            self.last_output = result["output"]
+            self.open_button.configure(state="normal")
+            self._set_text(self.report_text, json.dumps(result["report"], indent=2, default=str))
+            self.tabs.select(1)
+            self.status.set("Grouped export ready: " + result["output"])
+        self._run(lambda token, log, progress: grouped_export.export(
+            options, folder, government=government, cancel=token, log=log, progress=progress), done)
 
     def _create_large_subset(self, source, output, selected):
         def done(result):
@@ -1138,6 +1169,11 @@ class App(tk.Tk):
         body.pack(fill="both", expand=True)
         summary_text = tk.StringVar()
         ttk.Label(body, textvariable=summary_text, style="Title.TLabel").pack(anchor="w", pady=(0, 8))
+        def open_ai_review():
+            import ai_dialog
+            ai_dialog.show(self, options, result)
+        ttk.Button(body, text="AI-assisted classification (Claude)",
+                   command=open_ai_review).pack(anchor="w", pady=(0, 8))
         panes = ttk.Panedwindow(body, orient="horizontal")
         panes.pack(fill="both", expand=True)
 
@@ -1415,6 +1451,14 @@ class App(tk.Tk):
         data = report["mineplan_earth"]
         lines = ["EXPORT READY", "", result["output"], "", f"Features: {data['features_exported']}",
                  f"Altitude mode: {data['altitude_mode']}", "", "LAYERS"]
+        metrics = report.get("quality_metrics", {})
+        coverage = metrics.get("classification_coverage_out_of_100")
+        lines[0:0] = [
+            f"Classification coverage: {coverage:.2f}/100" if coverage is not None else "Classification coverage: not assessed",
+            "Independently verified accuracy: not measured",
+            f"Processing time: {report.get('performance', {}).get('processing_seconds', 0):.3f} seconds",
+            "Coverage measures assignments, not their correctness.", "",
+        ]
         lines += [f"  {name}: {count}" for name, count in data["layer_counts"].items()]
         controls = report.get("coordinate_control")
         if controls:
@@ -1438,9 +1482,18 @@ class App(tk.Tk):
                 f"Recognised legend folders: {len(semantic.get('allowed_legend_categories', []))}",
                 f"Matched to legend folders: {semantic.get('classified_records', 0)}",
                 f"Unclassified - review required: {semantic.get('unclassified_records', 0)}",
+                f"Year known, feature role requires review: {semantic.get('feature_role_review_records', 0)}",
                 f"Saved review decisions applied: {semantic.get('manual_rules_loaded', 0)}",
                 "Policy: file-local legend, constrained geometry rules, and saved human review.",
                 "Uncertain objects remain unclassified until a reviewer decides.",
+            ]
+            source_legend = semantic.get("source_legend") or report.get("source_legend") or {}
+            coverage = semantic.get("legend_coverage", [])
+            lines += [
+                f"Legend swatch observations: {source_legend.get('legend_labels_found', 0)}",
+                f"Swatch pairings requiring review: {len(source_legend.get('pairings_requiring_review', []))}",
+                f"Legend entries without matched features: {sum(row.get('status') != 'matched' for row in coverage)}",
+                "Export folders retain the plate's original legend wording when the name is unambiguous.",
             ]
         audit = report.get("mining_geometry_audit")
         if audit:

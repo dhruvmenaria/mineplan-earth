@@ -7,6 +7,7 @@ import json
 import math
 import os
 import tempfile
+import time
 import zipfile
 from collections import Counter
 from dataclasses import asdict, dataclass, replace
@@ -23,7 +24,7 @@ import semantic_layers
 
 NS = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", NS)
-APP_VERSION = "0.13.0"
+APP_VERSION = "0.18.0"
 APP_AUTHOR = "Dhruv Menaria"
 WGS84_GEOD = Geod(ellps="WGS84")
 
@@ -56,6 +57,9 @@ class Options:
     semantic_categories: tuple[str, ...] = ()
     coordinate_control_json: str = ""
     government_clean_preset: bool = False
+    frozen_plan_detection_json: str = ""
+    semantic_manual_rules: tuple = ()
+    source_legend_json: str = ""
 
 
 def el(parent, tag, text=None, **attributes):
@@ -112,6 +116,8 @@ def scan(options, *, cancel=None, log=lambda _: None, progress=lambda *_: None):
 
 
 def analyze_plan_sheets(options):
+    if options.frozen_plan_detection_json:
+        return json.loads(options.frozen_plan_detection_json)
     return plan_sheets.detect(options.input_path, margin=options.plan_margin)
 
 
@@ -201,11 +207,13 @@ def prepare_semantic_review(options, *, cancel=None, log=lambda _: None,
         records, style_hints=hints, plan_style_hints=plan_hints,
         dominant_style_hints=dominant_hints,
         allowed_categories=allowed_categories,
+        legend_report=legend_report,
         manual_rules=rules_document.get("rules", ()))
     semantic_summary["source_legend"] = legend_report
     semantic_summary["review_rules_path"] = str(review_rules.rule_path(options.input_path))
     unclassified = [record for record in records
-                    if record.get("semantic_category") == "UNCLASSIFIED - REVIEW"]
+                    if record.get("semantic_category") == "UNCLASSIFIED - REVIEW"
+                    or record.get("feature_role_review_required")]
     progress(1.0, "Classification review ready")
     return {
         "records": records,
@@ -447,6 +455,9 @@ def make_kml(output_layers, options, report, cancel=None):
                     visible = "1" if (first_plan_name is None or
                                       plan_name in {first_plan_name, "Shared base map"}) else "0"
                 folder_visibility[layer] = visible
+                if folder_name == "DRAWING FRAME":
+                    visible = "0"
+                    folder_visibility[layer] = visible
                 # Google Earth Pro derives checkbox state from descendants as well
                 # as the parent folder.  Carry the initial plan state down to the
                 # layer folder and each Placemark so hidden years stay hidden on
@@ -486,6 +497,8 @@ def make_kml(output_layers, options, report, cancel=None):
             ext = el(pm, "ExtendedData")
             for field in ["cad_layer", "original_cad_layer", "semantic_category",
                           "classification_method", "classification_confidence",
+                          "legend_label", "resolution_note", "legend_candidates",
+                          "source_year", "feature_role_review_required", "hatch_pattern", "hatch_angle", "hatch_scale",
                           "entity_type", "entity_handle", "text_value", "block_name",
                           "color_hex", "linetype"]:
                 value = row.get(field)
@@ -579,6 +592,7 @@ def _aligned_detected_lease_boundaries(plan_detection, selected_ids):
 
 
 def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=lambda *_: None):
+    started = time.perf_counter()
     output = Path(output_path).expanduser().resolve()
     if output.suffix.lower() not in {".kml", ".kmz"}:
         raise ValueError("The output filename must end in .kml or .kmz.")
@@ -611,7 +625,7 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
                 margin=options.plan_margin, cancel=token,
                 include_plan_boundary=not options.exclude_plan_boundary,
                 include_sheet_frame=not options.exclude_sheet_frame)
-        legend_report = None
+        legend_report = json.loads(options.source_legend_json) if options.source_legend_json else None
         if options.semantic_folders:
             progress(0.70, "Reading this drawing's legend folders")
             hints = {
@@ -653,17 +667,23 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
                         "scope": "current_source_dxf_only",
                     }
                     log(legend_report["warning"])
-            if allowed_categories or rules_document.get("rules"):
+            if allowed_categories or rules_document.get("rules") or any(
+                    str(record.get("cad_layer") or "0").split(" / ")[-1] == "0"
+                    for record in records):
                 progress(0.72, "Grouping features by this drawing's AutoCAD legend")
                 records, semantic_summary = semantic_layers.classify_records(
                     records, style_hints=hints,
                     plan_style_hints=plan_hints,
                     dominant_style_hints=dominant_hints,
                     allowed_categories=allowed_categories,
-                    manual_rules=rules_document.get("rules", ()))
+                    legend_report=legend_report,
+                    manual_rules=options.semantic_manual_rules or rules_document.get("rules", ()))
                 semantic_summary["source_legend"] = legend_report
                 semantic_summary["review_rules_path"] = str(
                     review_rules.rule_path(options.input_path))
+                if semantic_summary.get("feature_role_review_records"):
+                    quality.add_issue("warning", "year_geometry_role_review",
+                        f"{semantic_summary['feature_role_review_records']} objects match an explicit year-colour key but their feature role still needs review.")
             else:
                 log("No recognised AutoCAD legend was found; preserving original CAD layer folders.")
         mining_audit = None
@@ -677,6 +697,15 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
                 records, metre_units=metre_units,
                 lease_boundaries=_aligned_detected_lease_boundaries(
                     plan_detection, options.plan_ids))
+            if metre_units:
+                projection = Transformer.from_crs(source_crs, 4326, always_xy=True)
+                from shapely.ops import transform
+                for item in mining_audit["lease_areas"]:
+                    lease = _aligned_detected_lease_boundaries(plan_detection, options.plan_ids).get(item["plan"])
+                    if lease is not None:
+                        area, _ = _polygon_metrics(transform(projection.transform, lease))
+                        item["ellipsoidal_area_hectares"] = area / 10000
+                        item["area_basis"] = "projected planar; ellipsoidal WGS84 separately reported"
             if mining_audit["status"] != "pass":
                 quality.add_issue(
                     "warning", "mining_geometry_review",
@@ -737,6 +766,7 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
                 "survey_control_points": plan_detection["control_points"],
                 "control_match_error_drawing_units": plan_detection["control_match_error"],
                 "detected_location": plan_detection.get("location"),
+                "fit_diagnostics": plan_detection.get("fit_diagnostics", {}),
                 "detected_plan_boundary_excluded": options.exclude_plan_boundary,
                 "oversized_sheet_frame_excluded": options.exclude_sheet_frame,
                 "crop_margin_drawing_units": options.plan_margin,
@@ -763,8 +793,18 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
         report["finished_utc"] = cad._utc_now()
         report["outputs"] = [str(output)]
         report["review_required"] = True
-        report_bytes = json.dumps(report, ensure_ascii=False, indent=2, default=str).encode("utf-8")
         _atomic_bytes(output, payload)
+        report["quality_metrics"] = classification_metrics(semantic_summary)
+        elapsed = max(time.perf_counter() - started, 1e-9)
+        report["performance"] = {
+            "processing_seconds": round(elapsed, 3),
+            "features_per_second": round(report["mineplan_earth"]["features_exported"] / elapsed, 2),
+            "source_size_bytes": Path(options.input_path).stat().st_size,
+            "output_size_bytes": len(payload),
+            "efficiency_score_out_of_100": None,
+            "scope": "Elapsed conversion and output-file writing time; excludes QA report writing. No standardised efficiency benchmark has been run.",
+        }
+        report_bytes = json.dumps(report, ensure_ascii=False, indent=2, default=str).encode("utf-8")
         _atomic_bytes(report_path, report_bytes)
         progress(1.0, "Export ready - verify against your survey control points")
         return {"output": str(output), "report_path": str(report_path), "report": report}
@@ -782,6 +822,25 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
         except OSError:
             pass
         raise
+
+
+def classification_metrics(summary):
+    """Coverage describes assignments; it is not an independent accuracy test."""
+    summary = summary or {}
+    total = int(summary.get("total_records", 0))
+    unknown = int(summary.get("unclassified_records", 0))
+    role_review = int(summary.get("feature_role_review_records", 0))
+    complete = max(0, total - unknown - role_review)
+    return {
+        "classification_coverage_out_of_100": round(100 * complete / total, 2) if total else None,
+        "records_assessed": total,
+        "assigned_without_pending_role_review": complete,
+        "unclassified_records": unknown,
+        "year_known_feature_role_pending": role_review,
+        "independently_verified_accuracy_out_of_100": None,
+        "accuracy_status": "not_measured",
+        "scope": "Assignment coverage of extracted/aligned records before optional export filters. Assigned categories may still be incorrect; omitted/unsupported source objects are not included in this denominator.",
+    }
 
 
 GOVERNMENT_FILENAMES = (
@@ -936,6 +995,7 @@ def convert_submission(options, parent_directory, *, cancel=None,
             semantic_plan_style_hints=plan_style_hints,
             semantic_dominant_style_hints=dominant_style_hints,
             semantic_categories=legend_categories,
+            source_legend_json=json.dumps(legend_report),
             government_clean_preset=True)
 
         def group_progress(value, status, i=index):
@@ -961,6 +1021,8 @@ def convert_submission(options, parent_directory, *, cancel=None,
             "semantic_classification": result["report"].get("semantic_classification", {}),
             "mining_geometry_audit": result["report"].get("mining_geometry_audit", {}),
             "government_clean_preset": result["report"].get("government_clean_preset", {}),
+            "quality_metrics": result["report"].get("quality_metrics", {}),
+            "performance": result["report"].get("performance", {}),
         })
 
     produced = {item["filename"] for item in files}
@@ -1008,6 +1070,10 @@ def convert_submission(options, parent_directory, *, cancel=None,
         "source_legend": legend_report,
         "government_clean_preset": True,
         "mining_geometry_issue_counts": {"error": audit_errors, "review": audit_reviews},
+        "quality_metrics": classification_metrics({
+            "total_records": classified_total, "unclassified_records": unclassified,
+            "feature_role_review_records": sum(item.get("semantic_classification", {}).get("feature_role_review_records", 0) for item in files),
+        }),
     }
     manifest = qa_folder / "submission-manifest.json"
     checklist = qa_folder / "REVIEW BEFORE SUBMISSION.txt"

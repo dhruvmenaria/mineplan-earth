@@ -20,6 +20,7 @@ def _normalise(value):
 
 # More specific rules must come before general words such as BOUNDARY or ROAD.
 CATEGORY_RULES = (
+    ("GEO COORDINATES", (r"^GEO COORDINATES$",)),
     ("Boundary pillars", (r"\bBOUNDARY PILLAR", r"\bBP\s*[- ]?\d+\b")),
     ("500 M. BOUNDARY", (r"\b500\s*M(?:ETRE|ETER)?\b.*\bBOUNDARY",)),
     ("60 M. BOUNDARY", (r"\b60\s*M(?:ETRE|ETER)?\b.*\bBOUNDARY",)),
@@ -30,14 +31,14 @@ CATEGORY_RULES = (
                     r"\b(?:PIT|QUARRY)\b.*\bPROP(?:OSED)?\b")),
     ("PROP. YEAR WISE WORKING", (r"\bPROP(?:OSED)?\b.*\bYEAR\b.*\bWORK", 
                                   r"\bYEAR WISE (?:PIT|WORK)")),
-    ("PROP. MINERAL REJECT DUMP", (r"\bMINERAL REJECT DUMP\b", r"\bMRL\b.*\bDUMP\b")),
+    ("PROP. MINERAL REJECT DUMP", (r"\bMINERAL REJECT DUMP\b", r"\bMRL\b.*\bDUMP\b",
+                                   r"\bPROP(?:OSED)?\b.*\b(?:MINERAL|REJECT)\b.*\bDUMP\b")),
     ("PROP. OVERBURDEN / WASTE DUMP", (
         r"\bPROP(?:OSED)?\b.*\b(?:OVER\s*BURDEN|OB|WASTE)\b.*\bDUMP\b",
         r"\b(?:OVER\s*BURDEN|OB|WASTE)\b.*\bDUMP\b.*\bPROP(?:OSED)?\b")),
-    ("PROP. TOPSOIL STACK", (r"\bPROP(?:OSED)?\b.*\bTOP\s*SOIL\b",
-                              r"\bTOP\s*SOIL\b.*\b(?:STACK|DUMP|YARD)\b")),
+    ("PROP. TOPSOIL STACK", (r"\bPROP(?:OSED)?\b.*\bTOP\s*SOIL\b",)),
     ("PROP. MINERAL STACK YARD", (r"\bMINERAL (?:STACK|STOCK) YARD\b",)),
-    ("PROP. BACKFILL DUMP", (r"\bBACKFILL DUMP\b",)),
+    ("PROP. BACKFILL DUMP", (r"\bBACK\s*FILL DUMP\b",)),
     ("PROP. RETAINING WALL", (r"\bRETAINING WALL\b",)),
     ("PROP. GARLAND DRAIN", (r"\bGARLAND DRAIN\b",)),
     ("PROP. FENCING", (r"\bFENCING\b",)),
@@ -57,16 +58,16 @@ CATEGORY_RULES = (
     ("RECLAIMED AREA", (r"\bRECLAIM(?:ED|ATION)?\b.*\bAREA\b",)),
     ("VIRGIN AREA", (r"\bVIRGIN\b.*\bAREA\b",)),
     ("EXIST. PIT", (r"\bEXIST(?:ING)?\b.*\b(?:PIT|QUARRY)\b", r"\bPIT\s*[- ]?\d+\b")),
-    ("EXIST. WELL", (r"\bEXIST(?:ING)?\b.*\bWELL\b", r"\bWELL\b")),
+    ("EXIST. WELL", (r"\bEXIST(?:ING)?\b.*\bWELL\b", r"^WELL(?:\s+\d+)?$")),
     ("EXIST. SCREENING", (r"\bEXIST(?:ING)?\b.*\bSC+RE+N+ING\b",)),
     ("SURVEY STATION", (r"\bSURVEY STATION\b",)),
     ("TREE", (r"\bTREE\b",)),
     ("HUTMENTS", (r"\bHUTMENTS?\b",)),
     ("NALA", (r"\bNALA\b",)),
     ("WATER RESERVOIR AREA", (r"\bWATER RESERVOIR\b",)),
-    ("SOIL", (r"\bSOIL\b",)),
+    ("SOIL", (r"^SOIL$",)),
     ("CONTOUR", (r"\bCONTOUR\b",)),
-    ("BENCH MARK", (r"\bBENCH MARK\b", r"\bB\s*M\b")),
+    ("BENCH MARK", (r"\bBENCH MARK\b", r"^B\s*M(?:\s+\d+)?$")),
     ("SECTION LINE", (r"\bSECTION LINE\b",)),
     ("GRID LINE", (r"\bGRID LINE\b",)),
     ("ELECTRIC LINE", (r"\bELECTRIC (?:LINE|WIRE)\b",)),
@@ -80,6 +81,10 @@ CATEGORY_RULES = (
 
 
 def category_for_text(value):
+    if re.search(r"[NE]\s*\d+.*[°º�]", str(value or "").upper()):
+        from plan_sheets import _gps_coordinates
+        if _gps_coordinates([(0, 0, str(value))]):
+            return "GEO COORDINATES"
     text = _normalise(value)
     if not text:
         return None
@@ -200,12 +205,18 @@ def mining_geometry_audit(records, *, metre_units=True, lease_boundaries=None):
         coordinates = list(get_coordinates(target))
         if not coordinates:
             return []
-        step = max(1, len(coordinates) // 100)
-        return sorted(Point(xy[:2]).distance(lease_boundary)
-                      for xy in coordinates[::step])
+        lines = list(target.geoms) if hasattr(target, "geoms") else [target]
+        samples = []
+        total_length = sum(line.length for line in lines)
+        for line in lines:
+            count = max(2, round(200 * line.length / max(total_length, 1e-9)))
+            samples.extend(line.interpolate(i / count, normalized=True).distance(lease_boundary)
+                           for i in range(count))
+        return sorted(samples)
 
     checked_features = 0
     lease_areas = []
+    buffer_checks = []
     for plan, members in plans.items():
         leases = [record["geometry"] for record in members
                   if record.get("semantic_category") == "LEASE BOUNDARY"
@@ -286,7 +297,18 @@ def mining_geometry_audit(records, *, metre_units=True, lease_boundaries=None):
                 measured = distances[len(distances) // 2]
                 expected = expected_distances[category]
                 tolerance = max(1.5, expected * 0.10)
-                if abs(measured - expected) > tolerance:
+                deviations = sorted(abs(value - expected) for value in distances)
+                within = 100 * sum(value <= tolerance for value in deviations) / len(deviations)
+                statistics = {
+                    "plan": plan, "category": category,
+                    "minimum_metres": min(distances), "median_metres": measured,
+                    "maximum_metres": max(distances),
+                    "p95_deviation_metres": deviations[min(len(deviations)-1, int(len(deviations)*0.95))],
+                    "maximum_deviation_metres": max(deviations),
+                    "within_tolerance_percent": within,
+                }
+                buffer_checks.append(statistics)
+                if within < 95:
                     add("review", "buffer_distance_mismatch", plan,
                         f"{category} is approximately {measured:.2f} m from the lease boundary; expected about {expected:g} m.",
                         category=category, measured_metres=measured,
@@ -299,6 +321,7 @@ def mining_geometry_audit(records, *, metre_units=True, lease_boundaries=None):
         "plans_checked": len(plans),
         "controlled_features_checked": checked_features,
         "lease_areas": lease_areas,
+        "buffer_checks": buffer_checks,
         "counts": dict(counts),
         "issues": issues,
         "review_required": True,
@@ -344,6 +367,12 @@ def _raw_entity_style(entity, doc):
 def _entity_box(entity):
     """Small, dependency-local bounding box helper for DXF legend samples."""
     entity_type = entity.dxftype().upper()
+    if entity_type == "HATCH":
+        with contextlib.suppress(Exception):
+            from ezdxf import bbox
+            bounds = bbox.extents([entity], fast=True)
+            if bounds.has_data:
+                return (bounds.extmin.x, bounds.extmin.y, bounds.extmax.x, bounds.extmax.y)
     points = []
     with contextlib.suppress(Exception):
         if entity_type == "LINE":
@@ -396,6 +425,33 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
 
     observations = []
     skipped = Counter()
+    text_rows = []
+    for item in entities:
+        if item.dxftype().upper() not in TEXT_TYPES:
+            continue
+        value = item.plain_text() if item.dxftype().upper() == "MTEXT" else str(getattr(item.dxf, "text", "") or "")
+        position = getattr(item.dxf, "insert", None)
+        height = float(getattr(item.dxf, "char_height", getattr(item.dxf, "height", 1.0)) or 1.0)
+        if position is not None:
+            text_rows.append((item, value.strip(), position, height))
+    headings = [(p, h) for _, value, p, h in text_rows
+                if _normalise(value) in {"INDEX", "LEGEND", "GEOLOGICAL INDEX", "GEOLOGICAL LEGEND"}]
+    index_regions = []
+    for heading, heading_height in headings:
+        anchors = [(p, h) for _, value, p, h in text_rows
+                   if category_for_text(value) and 4 <= len(value) <= 55
+                   and 0 < heading.y - p.y < heading_height * 55
+                   and -heading_height * 2 < p.x - heading.x < heading_height * 18]
+        if not anchors:
+            continue
+        column = max(anchors, key=lambda anchor: sum(
+            abs(p.x - anchor[0].x) < max(h, anchor[1]) * 2 for p, h in anchors))
+        aligned = [(p, h) for p, h in anchors if abs(p.x - column[0].x) < max(h, column[1]) * 2]
+        levels = sorted({p.y for p, _ in aligned})
+        gaps = sorted(b - a for a, b in zip(levels, levels[1:]) if b > a)
+        row_margin = max(column[1] * 3, min(gaps[len(gaps)//2] * 1.25, column[1] * 6) if gaps else 0)
+        index_regions.append((column[0].x, min(p.y for p, _ in aligned) - row_margin,
+                              heading.y, column[1]))
     for label in entities:
         if label.dxftype().upper() not in TEXT_TYPES:
             continue
@@ -407,6 +463,17 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
             height = float(getattr(label.dxf, "height", 1.0) or 1.0)
         category = category_for_text(text)
         insertion = getattr(label.dxf, "insert", None)
+        # Unknown terminology is allowed only in a spatially evidenced index,
+        # never by promoting arbitrary map annotations to legend entries.
+        in_index = insertion is not None and any(
+            bottom <= insertion.y < top and abs(insertion.x - x) < max(h, height) * 2
+            for x, bottom, top, h in index_regions)
+        if not category and in_index and text.strip() and len(text.strip()) <= 120:
+            if len(_normalise(text)) >= 4 and not re.fullmatch(r"[\d\W]+", text.strip()) \
+                    and not re.search(r"\b(?:PLAN|SECTION|CERTIFIED|SCALE)\b|[°]", text.upper()):
+                category = text.strip()
+        if headings and not in_index:
+            continue
         if not category or insertion is None:
             continue
 
@@ -432,6 +499,12 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
             vertical_gap = abs(insertion.y - centre_y)
             if vertical_gap > maximum_vertical_distance:
                 continue
+            # A swatch must belong to this row rather than the next legend row.
+            other_rows = [abs(p.y - centre_y) for item, _, p, _ in text_rows
+                          if item is not label and abs(p.x - insertion.x) < height * 3
+                          and abs(p.y - insertion.y) > height * 0.6]
+            if other_rows and min(other_rows) + height * 0.15 < vertical_gap:
+                continue
             score = vertical_gap / max(height, 1e-9) + horizontal_gap / max(height * 8.0, 1e-9)
             candidates.append((score, entity))
         if not candidates:
@@ -453,6 +526,9 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
                 plan = min(matches, key=lambda item: item[0])[1]
         best_score = candidates[0][0]
         best_signature = _raw_entity_style(sample, doc)
+        competing = [score for score, candidate in candidates[1:]
+                     if _raw_entity_style(candidate, doc) != best_signature]
+        confidence = "HIGH" if not competing or min(competing) - best_score > 0.35 else "MEDIUM"
         # A legend symbol is often composed from several same-style entities
         # (for example three arcs plus a closed polyline for a tree).  Capture
         # each geometry family in that symbol, while rejecting differently
@@ -476,14 +552,54 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
                 "label_handle": getattr(label.dxf, "handle", None),
                 "sample_handle": getattr(candidate.dxf, "handle", None),
                 "signature": signature,
+                "pairing_confidence": confidence,
+                "pairing_score": round(best_score, 4),
+                "label_position": [float(insertion.x), float(insertion.y)],
+                "sample_bounds": _entity_box(candidate),
+                "block_name": str(getattr(candidate.dxf, "name", "") or ""),
+                "hatch_pattern": str(getattr(candidate.dxf, "pattern_name", "") or ""),
+                "hatch_angle": float(getattr(candidate.dxf, "pattern_angle", 0) or 0),
+                "hatch_scale": float(getattr(candidate.dxf, "pattern_scale", 1) or 1),
             }
             if plan is not None:
                 observation["plan_id"] = str(plan.get("id"))
                 observation["plan_title"] = str(plan.get("title"))
             observations.append(observation)
 
+    # Year-colour keys are commonly laid out horizontally below the main index,
+    # with I/II/III inside coloured boxes rather than left-hand swatches.
+    year_keys = []
+    for _, value, heading, height in text_rows:
+        if _normalise(value) != "PROP YEAR WISE WORKING":
+            continue
+        for label, roman, position, label_height in text_rows:
+            roman = roman.strip().upper()
+            if not re.fullmatch(r"I|II|III|IV|V|VI|VII|VIII|IX|X", roman):
+                continue
+            if not (0 < heading.y - position.y < height * 8
+                    and -height * 2 < position.x - heading.x < height * 60):
+                continue
+            boxes = [(entity, bounds) for entity, bounds in graphics
+                     if entity.dxftype() in {"LWPOLYLINE", "POLYLINE"}
+                     and bounds[0] - label_height <= position.x <= bounds[2] + label_height
+                     and bounds[1] - label_height <= position.y <= bounds[3] + label_height
+                     and label_height <= bounds[2] - bounds[0] <= label_height * 12
+                     and label_height <= bounds[3] - bounds[1] <= label_height * 8]
+            if not boxes:
+                continue
+            entity, bounds = min(boxes, key=lambda pair: (pair[1][2]-pair[1][0])*(pair[1][3]-pair[1][1]))
+            plan = next((p for p in (plan_detection or {}).get("plans", ())
+                         if (p.get("sheet_bounds") or p["crop_bounds"])[0] <= position.x <= (p.get("sheet_bounds") or p["crop_bounds"])[2]
+                         and (p.get("sheet_bounds") or p["crop_bounds"])[1] <= position.y <= (p.get("sheet_bounds") or p["crop_bounds"])[3]), None)
+            if plan is not None:
+                year_keys.append({"plan_id": str(plan["id"]), "year": roman,
+                                  "signature": _raw_entity_style(entity, doc),
+                                  "sample_handle": entity.dxf.handle,
+                                  "label_handle": label.dxf.handle})
     votes = defaultdict(Counter)
     for observation in observations:
+        if observation["pairing_confidence"] != "HIGH":
+            continue
         votes[observation["signature"]][observation["category"]] += 1
     rules = {}
     ambiguous = []
@@ -517,6 +633,8 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
                 })
     plan_votes = defaultdict(Counter)
     for observation in observations:
+        if observation["pairing_confidence"] != "HIGH":
+            continue
         plan_id = observation.get("plan_id")
         if plan_id:
             plan_votes[(plan_id, observation["signature"])][observation["category"]] += 1
@@ -542,6 +660,11 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
         "plan_style_rules": plan_rules,
         "categories_found": sorted({item["category"] for item in observations}),
         "observations": observations,
+        "year_colour_keys": year_keys,
+        "pairings_requiring_review": [item for item in observations if item["pairing_confidence"] != "HIGH"],
+        "legend_names_by_plan": {
+            plan_id: sorted({item["label"] for item in observations if item.get("plan_id", "") == plan_id})
+            for plan_id in {item.get("plan_id", "") for item in observations}},
         "ambiguous_styles": ambiguous,
         "dominant_style_rules": dominant_rules,
         "skipped": dict(skipped),
@@ -607,7 +730,7 @@ def learn_style_map(records):
 
 def classify_records(records, style_hints=None, plan_style_hints=None,
                      dominant_style_hints=None, allowed_categories=None,
-                     manual_rules=None):
+                     manual_rules=None, legend_report=None):
     """Group records with file-local evidence and exact human-review rules.
 
     Explicit layers and unambiguous legend styles are preferred. A small set of
@@ -615,6 +738,7 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
     geometry; anything uncertain remains reviewable rather than being guessed.
     """
     copied = [dict(record) for record in records]
+    source_observations = (legend_report or {}).get("observations", ())
 
     def polygon_parts(geometry):
         if geometry is None or geometry.is_empty:
@@ -675,15 +799,19 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
             category = None
             method = None
             confidence = None
+            if record.get("detected_lease_boundary"):
+                category, method, confidence = "LEASE BOUNDARY", "matched_survey_boundary", 0.99
+            elif record.get("detected_sheet_frame"):
+                category, method, confidence = "DRAWING FRAME", "detected_sheet_frame", 0.99
             boundary_category = environment_boundaries.get(str(record.get("entity_handle")))
-            if boundary_category and (not allowed or boundary_category in allowed):
+            if category is None and boundary_category and (not allowed or boundary_category in allowed):
                 category = boundary_category
                 method, confidence = "environment_boundary_geometry", 0.94
             if entity in TEXT_TYPES:
                 direct_map_category = category_for_map_annotation(
                     record.get("text_value"), plan_title)
                 category = category_for_text(record.get("text_value")) or direct_map_category
-                if category and (direct_map_category or not allowed or category in allowed):
+                if category and (category == "GEO COORDINATES" or direct_map_category or not allowed or category in allowed):
                     method, confidence = (
                         ("map_annotation", 0.95) if direct_map_category
                         else ("text_keyword", 0.98))
@@ -697,8 +825,15 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
                     category = None
             if category is None:
                 category = category_for_block(record)
-                if category and (not allowed or category in allowed):
+                explicit_tree = _normalise(record.get("block_name")) == "TREE" and category == "TREE"
+                if category and (explicit_tree or not allowed or category in allowed):
                     method, confidence = "named_block_or_attribute", 0.96
+                else:
+                    category = None
+            if category is None:
+                category, evidence = detailed_legend_match(record, source_observations)
+                if category and (not allowed or category in allowed):
+                    method, confidence = evidence, 0.96
                 else:
                     category = None
             if category is None:
@@ -743,7 +878,7 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
             if geometry is None or geometry.is_empty:
                 continue
             if pit_polygons:
-                covered = any(polygon.covers(geometry.representative_point())
+                covered = any(polygon.covers(geometry)
                               and geometry.envelope.area <= polygon.envelope.area * 1.05
                               for polygon in pit_polygons)
                 if covered:
@@ -881,6 +1016,49 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
                     record["classification_confidence"] = 0.87
                     record["cad_layer"] = f"{plan_title} / {category}"
 
+    # A single confirmed source block instance may expand to many components.
+    # Retain ownership only when all explicit evidence in that instance agrees.
+    block_groups = defaultdict(list)
+    for record in copied:
+        if record.get("block_path"):
+            block_groups[(str(record.get("plan_id") or ""), str(record["block_path"]))].append(record)
+    for members in block_groups.values():
+        evidence = {r["semantic_category"] for r in members
+                    if r.get("classification_method") in {
+                        "named_block_or_attribute", "plate_legend_block_identity", "plate_legend_hatch_pattern"}}
+        if len(evidence) == 1:
+            category = evidence.pop()
+            for record in members:
+                if record.get("semantic_category") == "UNCLASSIFIED - REVIEW":
+                    record.update(semantic_category=category, classification_method="confirmed_block_instance",
+                                  classification_confidence=0.94,
+                                  cad_layer=f"{record.get('plan_title') or 'Plan'} / {category}")
+
+    # Single-letter pillar labels need a matched boundary vertex, not merely a
+    # nearby line or similarly coloured object.
+    from shapely.geometry import Point
+    for title, indexes in by_plan.items():
+        vertices = []
+        for index in indexes:
+            record = copied[index]
+            if record.get("detected_lease_boundary") and record["geometry"].geom_type == "Polygon":
+                vertices.extend(Point(xy[:2]) for xy in list(record["geometry"].exterior.coords)[:-1])
+        for index in indexes:
+            record = copied[index]
+            if record.get("semantic_category") != "UNCLASSIFIED - REVIEW" or not vertices:
+                continue
+            if str(record.get("entity_type") or "").upper() not in TEXT_TYPES or not re.fullmatch(r"[A-Z](?:['′])?", str(record.get("text_value") or "").strip()):
+                continue
+            geometry = record.get("geometry")
+            limit = max(2.0, float(record.get("text_height") or 1) * 3)
+            near = [vertex for vertex in vertices if vertex.distance(geometry) <= limit]
+            if len(near) == 1:
+                record.update(semantic_category="Boundary pillars", classification_method="label_at_matched_lease_vertex",
+                              classification_confidence=0.93, cad_layer=f"{title} / Boundary pillars")
+
+    attach_source_annotations(copied, by_plan, allowed)
+    resolve_contour_shades(copied, by_plan, source_observations)
+
     # Near-identical geometry repeated on separately copied/aligned plan plates
     # represents the same real-world feature. Propagate only when multiple plan
     # copies agree on one already-classified category.
@@ -913,6 +1091,26 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
                 record["classification_confidence"] = 0.92
                 record["cad_layer"] = f"{plan_title} / {category}"
 
+    # Preserve year-colour ownership without claiming that every coloured line
+    # is a pit or dump. Explicit classifications above retain their meaning.
+    year_keys = (legend_report or {}).get("year_colour_keys", ())
+    for record in copied:
+        if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+            continue
+        if str(record.get("entity_type") or "").upper() not in {"LINE", "LWPOLYLINE", "POLYLINE", "SPLINE"}:
+            continue
+        signature = _style_signature(record)
+        years = {key["year"] for key in year_keys
+                 if key["plan_id"] == str(record.get("plan_id") or "")
+                 and tuple(key["signature"])[1:] == signature[1:]}
+        if len(years) == 1:
+            year = years.pop()
+            record.update(semantic_category=f"YEAR {year} - SOURCE GEOMETRY",
+                          classification_method="explicit_year_colour_key",
+                          classification_confidence=0.90, source_year=year,
+                          feature_role_review_required=True,
+                          cad_layer=f"{record.get('plan_title') or 'Plan'} / YEAR {year} - SOURCE GEOMETRY")
+
     # Human review is the final authority for this exact drawing. Entity rules
     # affect one source object; matching-style rules remain constrained to the
     # reviewed plan and original CAD layer.
@@ -920,7 +1118,7 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
     for record in copied:
         # The review window only resolves uncertain objects. Never let a broad
         # style decision replace an explicit layer or legend classification.
-        if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+        if record.get("semantic_category") != "UNCLASSIFIED - REVIEW" and not record.get("feature_role_review_required"):
             continue
         plan_id = str(record.get("plan_id") or "")
         handle = str(record.get("entity_handle") or "")
@@ -949,8 +1147,10 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
             "manual_entity_rule" if matching.get("scope") == "entity"
             else "manual_matching_style_rule")
         record["classification_confidence"] = 1.0
+        record["feature_role_review_required"] = False
         record["cad_layer"] = f"{plan_title} / {category}"
 
+    legend_coverage = apply_legend_names(copied, legend_report or {})
     counts = Counter(record.get("semantic_category") for record in copied)
     methods = Counter(record.get("classification_method") for record in copied)
     plan_summaries = {}
@@ -964,6 +1164,7 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
         "total_records": total,
         "classified_records": total - unclassified,
         "unclassified_records": unclassified,
+        "feature_role_review_records": sum(bool(record.get("feature_role_review_required")) for record in copied),
         "classified_percent": round((total - unclassified) * 100 / total, 2) if total else 0,
         "categories": dict(counts.most_common()),
         "methods": dict(methods.most_common()),
@@ -977,4 +1178,195 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
             "repeated_plan_evidence_and_exact_manual_review"),
         "plans": plan_summaries,
         "review_required": True,
+        "legend_coverage": legend_coverage,
     }
+
+
+def detailed_legend_match(record, observations):
+    """Resolve same-source block identities and distinct hatch patterns.
+
+    A same-colour swatch is insufficient: all matching candidates must agree
+    on meaning. Plate-local evidence takes precedence over shared evidence.
+    """
+    plan = str(record.get("plan_id") or "")
+    local = [entry for entry in observations if str(entry.get("plan_id") or "") == plan]
+    entries = local if local else [entry for entry in observations if not entry.get("plan_id")]
+    entries = [entry for entry in entries if entry.get("pairing_confidence", "HIGH") == "HIGH"]
+    block = str(record.get("block_name") or "").casefold()
+    if block:
+        candidates = {entry["category"] for entry in entries
+                      if str(entry.get("block_name") or "").casefold() == block}
+        if len(candidates) == 1:
+            return candidates.pop(), "plate_legend_block_identity"
+    pattern = str(record.get("hatch_pattern") or "").upper()
+    if pattern:
+        candidates = set()
+        for entry in entries:
+            if str(entry.get("hatch_pattern") or "").upper() != pattern:
+                continue
+            if str(entry["signature"][1]).upper() != str(record.get("color_hex") or "").upper():
+                continue
+            angle = abs((float(entry.get("hatch_angle", 0)) - float(record.get("hatch_angle", 0)) + 90) % 180 - 90)
+            if angle <= 1:
+                candidates.add(entry["category"])
+        if len(candidates) == 1:
+            return candidates.pop(), "plate_legend_hatch_pattern"
+    return None, None
+
+
+def attach_source_annotations(records, by_plan, allowed):
+    """Read explicit map text and attach only geometrically supported linework."""
+    from shapely.geometry import Point
+    from shapely import get_coordinates
+
+    def assign(record, category, method, confidence=0.94):
+        record.update(semantic_category=category, classification_method=method,
+                      classification_confidence=confidence,
+                      cad_layer=f"{record.get('plan_title') or 'Plan'} / {category}")
+
+    for indexes in by_plan.values():
+        labels = [records[i] for i in indexes if records[i].get("entity_type") in TEXT_TYPES]
+        for label in labels:
+            if label.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+                continue
+            text = str(label.get("text_value") or "").strip()
+            normal = _normalise(text)
+            if re.fullmatch(r"\d+(?:\.\d+)?\s*[NSEW]", normal):
+                assign(label, "GRID LINE", "explicit_grid_coordinate_label")
+            elif re.fullmatch(r"\d{3,4}(?:\.\d+)?", text):
+                assign(label, "SPOT LEVEL LABELS", "source_numeric_level_label", 0.85)
+            elif re.fullmatch(r"MSY(?: \d+)?", normal) and "PROP. MINERAL STACK YARD" in allowed:
+                assign(label, "PROP. MINERAL STACK YARD", "legend_supported_abbreviation")
+            elif normal == "S T" and "PROP. SETTLING TANK" in allowed:
+                assign(label, "PROP. SETTLING TANK", "legend_supported_abbreviation")
+            elif normal in {"L S", "LABOURSHED", "LABOUR SHED"} and "PROP. LABOUR SHED" in allowed:
+                assign(label, "PROP. LABOUR SHED", "legend_supported_abbreviation")
+            elif normal in {"OFC", "OFC AREA"} and "PROP. OFFICE" in allowed:
+                assign(label, "PROP. OFFICE", "legend_supported_abbreviation")
+            elif re.fullmatch(r"(?:MINERAL |REJECT )?DUMP(?: \d+)?", normal):
+                assign(label, "DUMP", "explicit_dump_label")
+            elif normal in {"AREA YET TO EXPLORE", "O B"}:
+                assign(label, text, "explicit_source_annotation")
+
+        section_labels = [label for label in labels
+                          if re.fullmatch(r"[XYZ](?:['′’])?", str(label.get("text_value") or "").strip())]
+        for index in indexes:
+            record = records[index]
+            if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
+                continue
+            geometry = record.get("geometry")
+            if geometry is None or geometry.is_empty or record.get("entity_type") in TEXT_TYPES:
+                continue
+            if geometry.geom_type == "LineString" and len(geometry.coords) == 2 and geometry.length > 10:
+                ends = [Point(geometry.coords[0][:2]), Point(geometry.coords[-1][:2])]
+                matches = [[label for label in section_labels
+                            if end.distance(label["geometry"]) <= max(3, float(label.get("text_height") or 1) * 4)]
+                           for end in ends]
+                pairs = [(a, b) for a in matches[0] for b in matches[1]
+                         if a is not b and str(a["text_value"])[0] == str(b["text_value"])[0]
+                         and len(str(a["text_value"]).strip()) != len(str(b["text_value"]).strip())]
+                if len(pairs) == 1:
+                    assign(record, "SECTION LINE", "paired_section_endpoint_labels")
+                    for label in pairs[0]:
+                        assign(label, "SECTION LINE", "paired_section_endpoint_labels")
+                    continue
+                grid_matches = [[label for label in labels if label.get("semantic_category") == "GRID LINE"
+                                 and end.distance(label["geometry"]) <= max(3, float(label.get("text_height") or 1) * 4)]
+                                for end in ends]
+                if all(grid_matches):
+                    assign(record, "GRID LINE", "paired_grid_endpoint_labels")
+                    continue
+            # Dump/yard/tank labels are often beside, rather than inside, a
+            # boundary. Same colour, short distance and unique meaning are all
+            # required; large enclosing frames cannot be claimed by this rule.
+            categories = set()
+            span = max(geometry.bounds[2]-geometry.bounds[0], geometry.bounds[3]-geometry.bounds[1])
+            for label in labels:
+                category = label.get("semantic_category")
+                if category not in {"PROP. MINERAL REJECT DUMP", "PROP. MINERAL STACK YARD", "PROP. SETTLING TANK", "DUMP", "EXIST. DUMP", "PROP. BACKFILL DUMP", "PROP. LABOUR SHED", "PROP. OFFICE"}:
+                    continue
+                height = float(label.get("text_height") or 1)
+                if str(record.get("color_hex")) != str(label.get("color_hex")) or span > max(50, height * 60):
+                    continue
+                if geometry.distance(label["geometry"]) <= max(3, height * 5):
+                    categories.add(category)
+            if len(categories) == 1:
+                assign(record, categories.pop(), "same_colour_feature_label", 0.89)
+
+
+def resolve_contour_shades(records, by_plan, observations):
+    """Match drafting shade variations only with independent level-label evidence."""
+    import colorsys
+    from shapely import get_num_coordinates
+
+    def hsv(color):
+        try:
+            rgb = bytes.fromhex(str(color).lstrip('#'))
+            return colorsys.rgb_to_hsv(*(v/255 for v in rgb)) if len(rgb)==3 else None
+        except ValueError:
+            return None
+
+    for _, indexes in by_plan.items():
+        plan = str(records[indexes[0]].get("plan_id") or "")
+        entries = [entry for entry in observations if str(entry.get("plan_id") or "")==plan
+                   and entry.get("pairing_confidence", "HIGH")=="HIGH"]
+        numeric = [records[i] for i in indexes if records[i].get("entity_type") in TEXT_TYPES
+                   and re.fullmatch(r"\d{2,4}(?:\.\d+)?",str(records[i].get("text_value") or '').strip())]
+        for i in indexes:
+            record = records[i]
+            g = record.get("geometry")
+            if record.get("semantic_category") != "UNCLASSIFIED - REVIEW" or g is None or g.geom_type not in {"LineString", "MultiLineString"} or get_num_coordinates(g)<8:
+                continue
+            color = hsv(record.get("color_hex"))
+            if color is None or color[1]<0.5:
+                continue
+            candidates = set()
+            for entry in entries:
+                signature = entry["signature"]
+                if signature[0]!='LINE' or signature[2]!=_style_signature(record)[2]:
+                    continue
+                other = hsv(signature[1])
+                if other and min(abs(color[0]-other[0]),1-abs(color[0]-other[0]))<=2/360 and abs(color[1]-other[1])<=0.05 and abs(color[2]-other[2])<=0.16:
+                    candidates.add(entry['category'])
+            if candidates != {"CONTOUR"}:
+                continue
+            if not any(g.distance(label['geometry']) <= max(3, float(label.get('text_height') or 1)*3) for label in numeric):
+                continue
+            record.update(semantic_category="CONTOUR", classification_method="contour_shade_and_level_evidence",
+                          classification_confidence=0.88, cad_layer=f"{record.get('plan_title') or 'Plan'} / CONTOUR")
+
+
+def apply_legend_names(records, report):
+    """Preserve each plate's wording while retaining internal semantic identities."""
+    observations = report.get("observations", ())
+    by_plan = defaultdict(list)
+    for entry in observations:
+        if entry.get("pairing_confidence", "HIGH") == "HIGH":
+            by_plan[str(entry.get("plan_id") or "")].append(entry)
+    matched = Counter()
+    for record in records:
+        plan_id = str(record.get("plan_id") or "")
+        entries = by_plan.get(plan_id, [])
+        category = record.get("semantic_category")
+        candidates = [entry for entry in entries if entry["category"] == category]
+        exact = [entry for entry in candidates
+                 if tuple(entry["signature"]) == _style_signature(record)]
+        names = {entry["label"] for entry in (exact or candidates)}
+        title = str(record.get("plan_title") or "Plan")
+        if len(names) == 1:
+            name = next(iter(names))
+            record["legend_label"] = name
+            record["cad_layer"] = f"{title} / {name}"
+            matched[(plan_id, name)] += 1
+        elif category == "UNCLASSIFIED - REVIEW":
+            source = str(record.get("original_cad_layer") or "0")
+            record["cad_layer"] = f"{title} / UNRESOLVED - {source}"
+            record["resolution_note"] = "Source meaning unresolved; geometry preserved for review."
+        elif len(names) > 1:
+            record["legend_candidates"] = sorted(names)
+            record["resolution_note"] = "Several legend names share this style/category; exact name requires review."
+    return [{"plan_id": plan, "legend_label": name,
+             "matched_records": matched[(plan, name)],
+             "status": "matched" if matched[(plan, name)] else "not_matched_review"}
+            for plan, name in sorted({(str(item.get("plan_id") or ""), item["label"])
+                                     for item in observations})]

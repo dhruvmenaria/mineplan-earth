@@ -39,9 +39,9 @@ def test_shared_base_geometry_is_kept_once_across_plans():
 
     result = plan_sheets._consolidate_shared_features(
         records, [{"id": "one"}, {"id": "two"}])
-    assert len(result) == 3
+    assert len(result) == 4
     assert {record["cad_layer"] for record in result} == {
-        "Shared base map / ROAD", "Shared base map / WORKING", "Year 2 / LEASE BOUNDARY"}
+        "Shared base map / ROAD", "Year 1 / WORKING", "Year 2 / WORKING", "Year 2 / LEASE BOUNDARY"}
 
 
 def test_shared_outer_boundary_is_owned_by_environment_plan():
@@ -71,3 +71,14 @@ def test_shared_outer_boundary_is_owned_by_environment_plan():
     assert shared[0]["plan_id"] == "environment"
     assert shared[0]["cad_layer"] == "Environment Plan / 0"
     assert len(result) == 4  # three unique working lines plus one shared outline
+
+
+def test_shared_features_require_all_plans_and_identical_style():
+    records = [{"geometry": LineString([(0, 0), (10, 10)]), "cad_layer": "ROAD",
+                "plan_id": plan, "color_hex": color}
+               for plan, color in [("one", "#FF0000"), ("two", "#0000FF")]]
+    assert len(plan_sheets._consolidate_shared_features(records, [{"id": "one"}, {"id": "two"}])) == 2
+    records[1]["color_hex"] = "#FF0000"
+    result = plan_sheets._consolidate_shared_features(records, [{"id": "one"}, {"id": "two"}, {"id": "three"}])
+    assert len(result) == 2
+    assert not any(record.get("plan_id") == "shared-base-map" for record in result)

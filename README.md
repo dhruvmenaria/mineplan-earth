@@ -2,7 +2,68 @@
 
 **Dhruv Menaria**
 
-Version 0.13.0 adds mining-specific geometry QA, a clean government-package
+Version 0.18.0 adds optional Claude-assisted classification with local evidence
+preparation, PNG previews, validated proposals and explicit human approval.
+The existing converter continues to work without an API key.
+
+## Optional Claude classification
+
+1. Analyse a drawing and choose **Review categories**.
+2. Click **AI-assisted classification (Claude)**. This prepares up to 12 review
+   cases locally, each with source handles, nearby text/styles, plate legend
+   observations and a cropped PNG of the extracted linework.
+3. **Save evidence (offline)** works without any API account. The JSON includes
+   base64 PNGs, instructions, response schema and an evidence-package identity.
+   To import a manually obtained response, retain its `evidence_package_id` and
+   supply an `assignments` array following the included schema.
+4. Later, configure `ANTHROPIC_API_KEY` in the computer's environment and restart
+   the application. Set `MINEPLAN_CLAUDE_MODEL` to a supported Claude model ID,
+   or enter that ID in the dialog. Do not put keys in source code, reports or Git.
+5. **Ask Claude** sends the displayed batch after confirmation. Only cropped
+   linework, labels, styles and legend metadata are submitted; the full DXF is
+   not uploaded. This API use can incur charges. Usage tokens appear in the UI.
+6. Select proposed mappings, inspect the image and cited evidence, then choose
+   **Save selected reviewed mappings**. Re-run review or export to apply them.
+
+The model proposes categories only; geometry, coordinates and CRS stay under
+the converter's control. Proposals with unknown case IDs, unsupported categories,
+invalid evidence references or conflicting duplicates are rejected. Rules are
+bound to the source SHA-256; changed drawings require new evidence. Objects
+without a unique plan/handle identity are left for the ordinary review workflow.
+The tool handles a bounded batch, not every unresolved object in one request.
+
+AI proposals are not independent verification or a measured accuracy score.
+The Claude adapter has been tested with mocked transport; live API performance,
+model quality and billing remain untested until an approved key/model is supplied.
+
+Version 0.17.0 fixes premature shared-base consolidation: only known static
+features identical in geometry and style across every selected plate can be
+shared. Year-specific and unresolved objects remain in their source plates.
+It recognises proposed mineral/reject-dump label variants, attaches nearby
+same-colour features, pairs section/grid endpoint labels and identifies source
+numeric level annotations. Detected drawing frames have a separate folder,
+hidden initially. These changes preserve source geometry and do not alter the
+coordinate transformation.
+
+Version 0.16.0 improved layer-0 classification with retained hatch patterns and
+angles, plate-local anonymous-block legend matching, confirmed block ownership,
+matched lease-boundary identities and coordinate annotations. Horizontal Roman
+year-colour keys can now group otherwise unidentified linework by source year.
+These year groups explicitly retain a feature-role review flag; they do not
+claim that every coloured line is a working pit or dump. Human review rules
+can resolve that remaining role. Pit containment now requires the full object
+to lie inside the pit, avoiding representative-point false matches.
+
+Version 0.15.0 added plate-specific legend wording, index-column and row checks,
+pairing confidence and legend coverage reports. Unknown legend terms can be
+retained inside evidenced index regions. Ambiguous pairs are reported and do
+not teach automatic style rules. Unresolved geometry is preserved under its
+original source layer in an `UNRESOLVED - ...` folder. Both full and government
+exports carry the source legend and per-feature naming evidence.
+
+Version 0.14.0 added sequential grouped large-DXF export, stricter mining text
+classification and GPS label parsing, panel-fit diagnostics, and sampled buffer
+distance statistics. The preceding release added mining-specific geometry QA, a clean government-package
 preset and cross-tool shape verification. MinePlan Earth now reports lease area,
 pit/dump containment, boundary-pillar offsets and approximate 7.5 m, 60 m and
 500 m boundary distances. Government KMZ members omit decorative contours,
@@ -19,7 +80,8 @@ See `THIRD_PARTY_NOTICES.md` and the preserved upstream license in `vendor/`.
 Double-click **Start MinePlan Earth.cmd**. Python 3.11 or newer is required (this installation uses Python 3.13).
 The local `.venv` has been installed on this computer. For a fresh copy, the launcher installs the dependencies on its first run.
 Run **Setup or Repair.cmd** if dependencies need reinstalling. Python's Tkinter component must be available.
-Conversion and the drawing preview run locally. No AI API, map API key, or file upload is used.
+Conversion and drawing preview run locally without a map or AI API key. Optional
+Claude-assisted classification sends selected evidence only when explicitly requested.
 The initial dependency installation requires internet access. Some specialized coordinate transformations may require separately supplied PROJ grid files.
 
 ## Try the demo
@@ -104,6 +166,25 @@ This permits comparison with geometrically equivalent KML from other tools while
 still flagging actual boundary displacement.
 
 ## Large DXF Mode
+
+**Grouped large export** processes the core together and then converts known
+contour/topography layers in bounded temporary DXF parts. All parts reuse the
+core's plan alignment, CRS and legend rules. The output includes individual
+KMZ parts, a self-contained `COMPLETE PLAN.kmz`, and a manifest with the source
+SHA-256 and reconciled DXF record counts. The complete file contains all parts
+and may still use substantial memory in Google Earth; open individual parts
+for lighter internal review. Choose the government purpose in the grouped-export
+dialog to skip contour/topography bulk before conversion and produce the existing
+self-contained plate package from the shared core. The manifest records those
+bulk records as deliberately excluded.
+
+Partitioning preserves POLYLINE/VERTEX/SEQEND and INSERT/ATTRIB groups. Mixed
+layers (including layer 0) remain in the core. A core larger than 64 MB, shared
+BLOCKS/header data above 32 MB, or an individual entity exceeding the 32 MB part
+budget causes an explicit stop rather than unsafe splitting. This first version
+does not partition arbitrary mixed layer-0 geometry or prune shared BLOCKS.
+Repeated plan layouts require selecting the core's plan sheets first. Verify
+the source CRS using survey controls before exporting.
 
 DXF files larger than 250 MB are indexed with a low-memory streaming reader instead of being fully opened. MinePlan Earth displays object and legacy-vertex totals by layer, lets you select the useful planning layers, and writes a lightweight working DXF without modifying the original. The working file is then analysed and exported normally. Avoid selecting layers with millions of vertices unless they are essential.
 
