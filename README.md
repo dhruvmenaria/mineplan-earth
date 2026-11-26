@@ -2,6 +2,20 @@
 
 **Dhruv Menaria**
 
+Version 0.19.0 improves offline classification of exact named tree blocks,
+split/abbreviated dump and facility labels, paired section endpoints A–Z and
+contour colour shades supported by the plate legend and nearby level labels.
+Unlabelled contours require three independently supported lines of that style
+in the same plate. Conflicting legend meanings remain unresolved. Generic dump
+labels retain a generic meaning; material is not inferred from the word dump.
+These rules change categories only, preserving geometry and coordinates.
+
+Export reports show progress against an 80% minimum coverage target and a 90%
+goal, including the number of additional objects requiring classification.
+These are targets, not a guarantee for every drawing and not verified accuracy.
+Unresolved source objects remain available for review; they are not hidden to
+raise the score. No API key is required for these improvements.
+
 Version 0.18.0 adds optional Claude-assisted classification with local evidence
 preparation, PNG previews, validated proposals and explicit human approval.
 The existing converter continues to work without an API key.

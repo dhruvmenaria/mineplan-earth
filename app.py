@@ -1459,6 +1459,14 @@ class App(tk.Tk):
             f"Processing time: {report.get('performance', {}).get('processing_seconds', 0):.3f} seconds",
             "Coverage measures assignments, not their correctness.", "",
         ]
+        if coverage is not None:
+            remaining = metrics.get("additional_assignments_for_90_percent")
+            minimum = metrics.get("additional_assignments_for_80_percent")
+            if minimum is not None and remaining is not None:
+                lines[1:1] = [
+                    f"80% minimum: {'met' if minimum == 0 else str(minimum) + ' more objects need classification'}",
+                    f"90% goal: {'met' if remaining == 0 else str(remaining) + ' more objects need classification'}",
+                ]
         lines += [f"  {name}: {count}" for name, count in data["layer_counts"].items()]
         controls = report.get("coordinate_control")
         if controls:

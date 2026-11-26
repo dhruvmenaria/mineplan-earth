@@ -38,7 +38,7 @@ CATEGORY_RULES = (
         r"\b(?:OVER\s*BURDEN|OB|WASTE)\b.*\bDUMP\b.*\bPROP(?:OSED)?\b")),
     ("PROP. TOPSOIL STACK", (r"\bPROP(?:OSED)?\b.*\bTOP\s*SOIL\b",)),
     ("PROP. MINERAL STACK YARD", (r"\bMINERAL (?:STACK|STOCK) YARD\b",)),
-    ("PROP. BACKFILL DUMP", (r"\bBACK\s*FILL DUMP\b",)),
+    ("PROP. BACKFILL DUMP", (r"\bBACK\s*FILL\s*DUMP\b",)),
     ("PROP. RETAINING WALL", (r"\bRETAINING WALL\b",)),
     ("PROP. GARLAND DRAIN", (r"\bGARLAND DRAIN\b",)),
     ("PROP. FENCING", (r"\bFENCING\b",)),
@@ -136,6 +136,10 @@ def category_for_map_annotation(value, plan_title=""):
     """Recognise terse map labels without teaching them as legend samples."""
     text = _normalise(value)
     title = _normalise(plan_title)
+    # The annotation identifies a dump, but does not establish its material.
+    # Keep that generic meaning rather than guessing mineral versus waste.
+    if re.fullmatch(r"(?:PROP(?:OSED)? )?(?:(?:\d+(?:ST|ND|RD|TH)?|I|II|III|IV|V) YEAR )?DUMP(?: (?:MRL )?\d+(?: \d+)?)?", text):
+        return "DUMP"
     if re.fullmatch(r"SC+RE+N+ING", text):
         return "EXIST. SCREENING"
     if "MINERAL REJECT BACK FILL" in text:
@@ -1249,7 +1253,7 @@ def attach_source_annotations(records, by_plan, allowed):
                 assign(label, text, "explicit_source_annotation")
 
         section_labels = [label for label in labels
-                          if re.fullmatch(r"[XYZ](?:['′’])?", str(label.get("text_value") or "").strip())]
+                          if re.fullmatch(r"[A-Z](?:['′’])?", str(label.get("text_value") or "").strip())]
         for index in indexes:
             record = records[index]
             if record.get("semantic_category") != "UNCLASSIFIED - REVIEW":
@@ -1308,10 +1312,11 @@ def resolve_contour_shades(records, by_plan, observations):
 
     for _, indexes in by_plan.items():
         plan = str(records[indexes[0]].get("plan_id") or "")
-        entries = [entry for entry in observations if str(entry.get("plan_id") or "")==plan
-                   and entry.get("pairing_confidence", "HIGH")=="HIGH"]
+        entries = [entry for entry in observations if str(entry.get("plan_id") or "")==plan]
         numeric = [records[i] for i in indexes if records[i].get("entity_type") in TEXT_TYPES
                    and re.fullmatch(r"\d{2,4}(?:\.\d+)?",str(records[i].get("text_value") or '').strip())]
+        supported = Counter()
+        unlabelled = []
         for i in indexes:
             record = records[i]
             g = record.get("geometry")
@@ -1321,6 +1326,7 @@ def resolve_contour_shades(records, by_plan, observations):
             if color is None or color[1]<0.5:
                 continue
             candidates = set()
+            confirmed_contour = False
             for entry in entries:
                 signature = entry["signature"]
                 if signature[0]!='LINE' or signature[2]!=_style_signature(record)[2]:
@@ -1328,12 +1334,25 @@ def resolve_contour_shades(records, by_plan, observations):
                 other = hsv(signature[1])
                 if other and min(abs(color[0]-other[0]),1-abs(color[0]-other[0]))<=2/360 and abs(color[1]-other[1])<=0.05 and abs(color[2]-other[2])<=0.16:
                     candidates.add(entry['category'])
-            if candidates != {"CONTOUR"}:
+                    if entry['category'] == 'CONTOUR' and entry.get('pairing_confidence', 'HIGH') == 'HIGH':
+                        confirmed_contour = True
+            if candidates != {"CONTOUR"} or not confirmed_contour:
                 continue
             if not any(g.distance(label['geometry']) <= max(3, float(label.get('text_height') or 1)*3) for label in numeric):
+                unlabelled.append(record)
                 continue
             record.update(semantic_category="CONTOUR", classification_method="contour_shade_and_level_evidence",
                           classification_confidence=0.88, cad_layer=f"{record.get('plan_title') or 'Plan'} / CONTOUR")
+            supported[_style_signature(record)] += 1
+        # A contour need not carry a level on every line. Extend the same
+        # evidenced legend style only after three independent labelled lines
+        # confirm it in this plate; conflicting legend meanings already vetoed
+        # the candidate above. Short segments and other colours remain untouched.
+        for record in unlabelled:
+            if supported[_style_signature(record)] >= 3:
+                record.update(semantic_category="CONTOUR", classification_method="plate_confirmed_contour_shade",
+                              classification_confidence=0.85,
+                              cad_layer=f"{record.get('plan_title') or 'Plan'} / CONTOUR")
 
 
 def apply_legend_names(records, report):

@@ -370,3 +370,66 @@ def test_detected_frame_does_not_get_claimed_by_a_feature_label():
     label = _record("TEXT", Point(50, 50), text="PROP II YEAR REJECT DUMP MRL-445")
     result, _ = semantic_layers.classify_records([frame, label])
     assert result[0]["semantic_category"] == "DRAWING FRAME"
+
+
+def test_exact_named_tree_survives_incomplete_legend_without_claiming_other_blocks():
+    tree = dict(_record("ARC", LineString([(0, 0), (1, 1)])), block_name="TREE")
+    other = dict(tree, block_name="TREE_CANDIDATE")
+    result, _ = semantic_layers.classify_records([tree, other], allowed_categories=["CONTOUR"])
+    assert result[0]["semantic_category"] == "TREE"
+    assert result[0]["geometry"].equals_exact(tree["geometry"], 0)
+    assert result[1]["semantic_category"] == "UNCLASSIFIED - REVIEW"
+
+
+def test_generic_dump_annotation_does_not_guess_material():
+    assert semantic_layers.category_for_map_annotation("4th YEAR DUMP\nMRL-325.5") == "DUMP"
+    assert semantic_layers.category_for_map_annotation("PROP. DUMP-187") == "DUMP"
+    assert semantic_layers.category_for_text("BACKFILLDUMP") == "PROP. BACKFILL DUMP"
+    result, _ = semantic_layers.classify_records(
+        [_record("TEXT", Point(0, 0), text="4th YEAR DUMP\nMRL-325.5")],
+        allowed_categories=["CONTOUR"])
+    assert result[0]["semantic_category"] == "DUMP"
+
+
+def test_section_pair_accepts_letters_beyond_xyz_but_requires_matching_pair():
+    lines = [_record("LINE", LineString([(0, y), (30, y)]), color="#123456") for y in [0, 20]]
+    labels = [_record("TEXT", Point(0, 0), text="G"),
+              _record("TEXT", Point(30, 0), text="G'"),
+              _record("TEXT", Point(0, 20), text="A"),
+              _record("TEXT", Point(30, 20), text="B'")]
+    result, _ = semantic_layers.classify_records([*lines, *labels])
+    assert result[0]["semantic_category"] == "SECTION LINE"
+    assert result[1]["semantic_category"] == "UNCLASSIFIED - REVIEW"
+
+
+def _shade_case(y=0):
+    record = _record("POLYLINE", LineString([(x, y + x % 2) for x in range(10)]), color="#C79500")
+    record.update(plan_id="p1", semantic_category="UNCLASSIFIED - REVIEW")
+    return record
+
+
+def test_contour_shade_needs_plate_legend_and_independent_level_evidence():
+    entry = {"plan_id": "p1", "category": "CONTOUR", "pairing_confidence": "HIGH",
+             "signature": ["LINE", "#A57C00", "CONTINUOUS"]}
+    for entries, with_level, expected in [
+        ([entry], True, "CONTOUR"), ([entry], False, "UNCLASSIFIED - REVIEW"),
+        ([dict(entry, plan_id="other")], True, "UNCLASSIFIED - REVIEW"),
+        ([entry, dict(entry, category="DUMP")], True, "UNCLASSIFIED - REVIEW"),
+        ([entry, dict(entry, category="DUMP", pairing_confidence="MEDIUM")], True, "UNCLASSIFIED - REVIEW"),
+        ([dict(entry, pairing_confidence="MEDIUM")], True, "UNCLASSIFIED - REVIEW"),
+    ]:
+        records = [_shade_case()]
+        if with_level:
+            records.append(_record("TEXT", Point(4, 0), text="324.5"))
+        semantic_layers.resolve_contour_shades(records, {"p1": list(range(len(records)))}, entries)
+        assert records[0]["semantic_category"] == expected
+
+
+def test_unlabelled_contour_requires_three_independently_supported_lines():
+    entry = {"plan_id": "p1", "category": "CONTOUR", "pairing_confidence": "HIGH",
+             "signature": ["LINE", "#A57C00", "CONTINUOUS"]}
+    for count in [2, 3]:
+        records = [_shade_case(y * 20) for y in range(count)] + [_shade_case(100)]
+        records += [_record("TEXT", Point(4, y * 20), text=str(320+y)) for y in range(count)]
+        semantic_layers.resolve_contour_shades(records, {"p1": list(range(len(records)))}, [entry])
+        assert records[count]["semantic_category"] == ("CONTOUR" if count == 3 else "UNCLASSIFIED - REVIEW")

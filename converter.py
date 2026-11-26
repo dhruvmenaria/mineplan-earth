@@ -24,7 +24,7 @@ import semantic_layers
 
 NS = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", NS)
-APP_VERSION = "0.18.0"
+APP_VERSION = "0.19.0"
 APP_AUTHOR = "Dhruv Menaria"
 WGS84_GEOD = Geod(ellps="WGS84")
 
@@ -831,8 +831,16 @@ def classification_metrics(summary):
     unknown = int(summary.get("unclassified_records", 0))
     role_review = int(summary.get("feature_role_review_records", 0))
     complete = max(0, total - unknown - role_review)
+    needed_80 = max(0, math.ceil(total * 80 / 100) - complete)
+    needed_90 = max(0, math.ceil(total * 90 / 100) - complete)
     return {
         "classification_coverage_out_of_100": round(100 * complete / total, 2) if total else None,
+        "coverage_target_status": ("not_assessed" if not total else
+                                   "90_percent_goal_met" if not needed_90 else
+                                   "80_percent_minimum_met" if not needed_80 else
+                                   "below_80_percent_review_needed"),
+        "additional_assignments_for_80_percent": needed_80 if total else None,
+        "additional_assignments_for_90_percent": needed_90 if total else None,
         "records_assessed": total,
         "assigned_without_pending_role_review": complete,
         "unclassified_records": unknown,
