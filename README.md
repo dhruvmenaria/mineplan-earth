@@ -2,6 +2,88 @@
 
 **Dhruv Menaria**
 
+Version 0.22.0 simplifies AI review into one guided window:
+
+1. Click **AI review & export** on the main screen, enter a provider/key and **Ask AI**.
+2. Click suggestions to inspect their highlighted target and explanation. Tick
+   **Reviewed** beside the ones you checked, or explicitly **Mark all reviewed**.
+   Selecting a row alone never approves it. No suggestions are preapproved.
+3. Click **Save reviewed & export**. The app saves only checked mappings,
+   refreshes coverage, closes the review window and opens the normal export dialog.
+
+The table has a scrollbar and the preview uses a separate resizing panel to stay
+visible. Offline JSON tools and manual classification are under **More options**.
+**Save & next batch** refreshes unresolved objects and prepares the next unsent
+cases; it does not make another paid request automatically. **Skip batch** leaves
+those objects unresolved. Keys stay only in this window's memory across batches
+and are cleared on close/provider change, with no credential persistence to disk.
+
+Export reports now state **AI-reviewed mappings applied**, saved AI rules loaded,
+and coverage before saved review rules, so a successful model call cannot be
+confused with saved/applied mappings. Coverage remains separate from accuracy.
+The local SHIVSHANKAR check reproduced 12 saved/applied AI mappings and coverage
+of 86.26% before saved rules versus 86.48% after. This is assignment coverage,
+not an independent check of those twelve category decisions.
+
+Version 0.21.0 adds Gemini alongside Claude in **Review categories → AI-assisted
+classification**. Choose **Gemini**, model `gemini-2.5-flash`, and enter a temporary
+API key in the masked field, or set `GEMINI_API_KEY` locally. Temporary keys are
+cleared from the field after sending and are not written to source, settings,
+drawings or reports. `MINEPLAN_GEMINI_MODEL` can select another explicit model ID.
+Provider changes clear the temporary key and job consent. The request goes only
+to the selected provider; there is no fallback to another provider/model.
+
+Gemini receives the same bounded, redacted evidence through one forced function
+call. The same category, evidence, duplicate and geometry-edit checks apply.
+Blocked/truncated responses are rejected, and proposals require human approval.
+Usage includes input, output and thinking tokens plus the reported model ID.
+Google may change model availability or route legacy model IDs; see its official
+[deprecation schedule](https://ai.google.dev/gemini-api/docs/deprecations).
+
+A live `gemini-2.5-flash` smoke test on three redacted drawing objects returned
+three structurally valid proposals (2,712 input tokens, 204 output tokens).
+These were not applied or independently verified. This verifies integration,
+not a classification-accuracy percentage or a full-drawing cost estimate.
+
+Version 0.20.1 lets you continue exporting after a scale/rotation warning, without
+editing the source DXF. The desktop export actions show the fitted correction
+and ask **Continue export?**. Choosing Yes uses the same calculated transform;
+it does not certify or change the fit. The KML/KMZ description and QA report
+retain **UNVERIFIED ALIGNMENT**, and government/grouped manifests record the
+acknowledgement. This choice is per export, with no permanently enabled bypass.
+CLI users can explicitly pass `--allow-unverified-alignment`. Invalid transforms,
+wrong CRS, missing required controls and actual conversion errors still fail.
+
+Version 0.20.0 enforces automatic GPS alignment trust limits. A fitted scale
+outside 1 ± 0.001 or rotation outside ±1 degree requires survey review and
+blocks ordinary, government and grouped exports, even with a small residual.
+Discovery still identifies suspect plates, preventing fallback to ordinary
+layout-coordinate export. Saved detections are checked from their actual affine
+matrices, not a stored confidence flag. Repeated translated copies use one
+frozen orientation/scale to avoid symmetric-outline rotation alternatives.
+The UI and JSON reports expose per-plate scale and rotation. These limits are
+software triage thresholds, not survey-accuracy standards; check drawing units,
+orientation and control correspondences before correcting the source.
+
+AI evidence now keeps at most 30 nearby records per case, omits empty fields,
+uses local bounds rounded to three decimals, and includes only the relevant
+plates' compact legend observations. **Redaction is on by default**: GPS text,
+unknown names and custom style names are withheld; unfamiliar category names
+use aliases whose original labels stay local. This reduces context and can
+increase abstentions. Shapes can still identify a site; redaction does not
+guarantee anonymity. Use **Inspect outbound evidence** before approving a job.
+Disabling redaction may send names/location labels. Each request needs explicit
+job consent plus send confirmation; consent is not saved. Shared evidence files
+and API requests exclude private category mappings and source identities.
+
+The adapter uses the regular Messages API, not the discounted Batch API. Real
+cost depends on actual response usage; character-based token estimates and image
+allowances are only estimates. No live API quality/cost benchmark has run.
+Reports distinguish overall assignment coverage from built-in category coverage.
+IBM mapping stays **not assessed** until an approved IBM taxonomy is configured;
+free-text legend names do not establish compliance. Group rules and a verified
+human-labelled model benchmark are not implemented by this release.
+
 Version 0.19.0 improves offline classification of exact named tree blocks,
 split/abbreviated dump and facility labels, paired section endpoints A–Z and
 contour colour shades supported by the plate legend and nearby level labels.
@@ -26,14 +108,14 @@ The existing converter continues to work without an API key.
 2. Click **AI-assisted classification (Claude)**. This prepares up to 12 review
    cases locally, each with source handles, nearby text/styles, plate legend
    observations and a cropped PNG of the extracted linework.
-3. **Save evidence (offline)** works without any API account. The JSON includes
+3. **Save evidence (offline)** works without any API account. The shareable JSON includes
    base64 PNGs, instructions, response schema and an evidence-package identity.
    To import a manually obtained response, retain its `evidence_package_id` and
    supply an `assignments` array following the included schema.
 4. Later, configure `ANTHROPIC_API_KEY` in the computer's environment and restart
    the application. Set `MINEPLAN_CLAUDE_MODEL` to a supported Claude model ID,
    or enter that ID in the dialog. Do not put keys in source code, reports or Git.
-5. **Ask Claude** sends the displayed batch after confirmation. Only cropped
+5. Inspect the outbound evidence and approve this job. **Ask Claude** sends the batch after confirmation. Only cropped
    linework, labels, styles and legend metadata are submitted; the full DXF is
    not uploaded. This API use can incur charges. Usage tokens appear in the UI.
 6. Select proposed mappings, inspect the image and cited evidence, then choose

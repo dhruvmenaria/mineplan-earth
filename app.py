@@ -11,6 +11,8 @@ import tkinter as tk
 import webbrowser
 from tkinter import ttk, filedialog, messagebox
 from pathlib import Path
+from dataclasses import replace
+import plan_sheets
 
 import converter
 import coordinate_controls
@@ -341,7 +343,7 @@ class App(tk.Tk):
         self.preview_button = ttk.Button(bottom, text="Preview selected layers", command=self._preview)
         self.preview_button.pack(side="left")
         self.review_button = ttk.Button(
-            bottom, text="Review categories", command=self._review_unclassified,
+            bottom, text="AI review & export", command=self._review_with_ai,
             state="disabled", style="Soft.TButton")
         self.review_button.pack(side="left", padx=(8, 0))
         self.export_button = ttk.Button(bottom, text="Export KML / KMZ", style="Accent.TButton", command=self._export)
@@ -487,6 +489,8 @@ class App(tk.Tk):
                 error = self.plan_info.get("control_match_error", 0)
                 self.plan_summary.set(
                     f"{len(self.selected_plans)} plans selected; control fit residual {error:.3f} drawing units.")
+                if self.plan_info.get('fit_diagnostics', {}).get('review_required'):
+                    self.plan_summary.set(self.plan_summary.get() + ' Alignment warning; you can continue at export.')
             else:
                 self.selected_plans.clear()
                 self.plan_mode.set(False)
@@ -666,6 +670,9 @@ class App(tk.Tk):
         try:
             options = self._collect_options(selected=False)
             converter.job_for(options, export=True)
+            options = self._confirm_alignment_export(options)
+            if options is None:
+                return
             if Path(options.input_path).suffix.lower() != ".dxf":
                 raise ValueError("Grouped export requires an ASCII DXF.")
         except Exception as exc:
@@ -808,7 +815,8 @@ class App(tk.Tk):
         def render():
             tree.delete(*tree.get_children())
             for index, plan in enumerate(plans):
-                shift = f"{plan['translate_x']:.3f}, {plan['translate_y']:.3f}"
+                fit = __import__('plan_sheets').alignment_fit_diagnostics([plan])['per_plan'][0]
+                shift = f"scale {fit['scale']:.6f}; rot {fit['rotation_degrees']:.3f}°" if fit['scale'] is not None else 'Invalid transform'
                 tree.insert("", "end", iid=str(index), values=(
                     "Yes" if plan["id"] in selected else "-", plan["title"], shift,
                     plan["boundary_handle"]))
@@ -841,6 +849,8 @@ class App(tk.Tk):
                 error = self.plan_info.get("control_match_error", 0)
                 self.plan_summary.set(
                     f"{len(selected)} plans selected; {value:g}-unit map margin; control residual {error:.3f}.")
+                if self.plan_info.get('fit_diagnostics', {}).get('review_required'):
+                    self.plan_summary.set(self.plan_summary.get() + ' Alignment warning; you can continue at export.')
                 dialog.destroy()
             except ValueError as exc:
                 messagebox.showerror("Plan sheets", str(exc), parent=dialog)
@@ -1122,6 +1132,24 @@ class App(tk.Tk):
             self.status.set("Drawing preview ready. It uses source coordinates, not geographic placement.")
         self._run(lambda token, log, progress: converter.preview(options, cancel=token, log=log, progress=progress), done)
 
+    def _review_with_ai(self):
+        if self.busy:
+            return
+        try:
+            options = self._collect_options()
+            converter.job_for(options)
+        except Exception as exc:
+            messagebox.showerror('AI review',str(exc),parent=self)
+            return
+        def ready(review):
+            if not review.get('unclassified'):
+                messagebox.showinfo('AI review','No unresolved objects remain. You can export normally.',parent=self)
+                return
+            import ai_dialog
+            ai_dialog.show(self,options,review)
+        self._run(lambda token,log,progress: converter.prepare_semantic_review(
+            options,cancel=token,log=log,progress=progress),ready)
+
     def _review_unclassified(self):
         if self.busy:
             return
@@ -1171,8 +1199,9 @@ class App(tk.Tk):
         ttk.Label(body, textvariable=summary_text, style="Title.TLabel").pack(anchor="w", pady=(0, 8))
         def open_ai_review():
             import ai_dialog
+            dialog.destroy()
             ai_dialog.show(self, options, result)
-        ttk.Button(body, text="AI-assisted classification (Claude)",
+        ttk.Button(body, text="AI-assisted classification (Gemini / Claude)",
                    command=open_ai_review).pack(anchor="w", pady=(0, 8))
         panes = ttk.Panedwindow(body, orient="horizontal")
         panes.pack(fill="both", expand=True)
@@ -1414,12 +1443,39 @@ class App(tk.Tk):
         preview_record()
         dialog.grab_set()
 
+    def _confirm_alignment_export(self, options):
+        if options.plan_ids is None or not self.plan_info.get('available'):
+            return options
+        review = converter._alignment_review(options, self.plan_info)
+        diagnostics = review['selected_fit_diagnostics']
+        if any(not f['valid_similarity'] for f in diagnostics['per_plan']):
+            raise ValueError('The plan alignment contains an invalid transform; it cannot be exported.')
+        if not review['alignment_warning_required']:
+            return options
+        fits = [f for f in diagnostics['per_plan'] if f['review_required']]
+        unique = list(dict.fromkeys((round(f['scale'], 8), round(f['rotation_degrees'], 6)) for f in fits))
+        details = '\n'.join(f'Scale: {scale:.6f} ({(scale-1)*100:+.2f}%)  Rotation: {angle:.4f}°'
+                            for scale, angle in unique[:6])
+        if len(unique) > 6:
+            details += f'\nPlus {len(unique)-6} other fitted transforms.'
+        proceed = messagebox.askyesno(
+            'Alignment warning — continue export?',
+            f'{len(fits)} selected plan(s) need a scale/rotation correction beyond the automatic limits.\n\n'
+            f'{details}\n\n'
+            'You can export using this calculated alignment. No source DXF editing is needed.\n'
+            'Its position has not been independently verified. The KMZ and report will retain this warning.\n\n'
+            'Continue export?', parent=self)
+        return replace(options, allow_unverified_alignment=True) if proceed else None
+
     def _export(self):
         if self.busy:
             return
         try:
             options = self._collect_options()
             converter.job_for(options, export=True)
+            options = self._confirm_alignment_export(options)
+            if options is None:
+                return
         except Exception as exc:
             messagebox.showerror("Before exporting", str(exc))
             return
@@ -1459,6 +1515,13 @@ class App(tk.Tk):
             f"Processing time: {report.get('performance', {}).get('processing_seconds', 0):.3f} seconds",
             "Coverage measures assignments, not their correctness.", "",
         ]
+        lines.insert(1,f"AI-reviewed mappings applied: {metrics.get('ai_review_mappings_applied', 0)} (saved rules loaded: {metrics.get('ai_review_rules_loaded', 0)})")
+        before = metrics.get('coverage_before_review_rules')
+        if before is not None and coverage is not None:
+            lines.insert(2,f"Coverage before saved review rules: {before:.2f}/100 → now {coverage:.2f}/100")
+        standard = metrics.get('standard_taxonomy_coverage_out_of_100')
+        lines[4:4] = [f"Built-in category coverage: {standard:.2f}/100" if standard is not None else 'Built-in category coverage: not assessed',
+                      'IBM category mapping: not assessed (approved taxonomy not configured).']
         if coverage is not None:
             remaining = metrics.get("additional_assignments_for_90_percent")
             minimum = metrics.get("additional_assignments_for_80_percent")
@@ -1469,6 +1532,11 @@ class App(tk.Tk):
                 ]
         lines += [f"  {name}: {count}" for name, count in data["layer_counts"].items()]
         controls = report.get("coordinate_control")
+        if report.get('plan_sheet_alignment', {}).get('unverified_alignment_acknowledged'):
+            lines[0:0] = ['ALIGNMENT UNVERIFIED — exported after warning confirmation.', '']
+        fit = report.get("plan_sheet_alignment", {}).get("fit_diagnostics", {})
+        for item in fit.get("per_plan", []):
+            lines.append(f"Plan fit {item['plan_id']}: scale {item['scale']}, rotation {item['rotation_degrees']} degrees")
         if controls:
             lines += [
                 "", "COORDINATE CONTROL",
@@ -1547,6 +1615,9 @@ class App(tk.Tk):
         try:
             options = self._collect_options()
             converter.job_for(options, export=True)
+            options = self._confirm_alignment_export(options)
+            if options is None:
+                return
             if options.plan_ids is None:
                 raise ValueError("Enable Plan mode and select the detected plan sheets first.")
         except Exception as exc:

@@ -13,6 +13,36 @@ from collections import defaultdict
 import math
 import re
 
+# Automatic GPS alignment assumes metre-sized, grid-oriented plan copies.
+# These are software review thresholds, not survey-accuracy specifications.
+AUTO_SCALE_TOLERANCE = 0.001
+AUTO_ROTATION_TOLERANCE_DEGREES = 1.0
+
+
+def alignment_fit_diagnostics(plans):
+    """Derive trust limits from actual affines, including older frozen detections."""
+    fits = []
+    for plan in plans:
+        affine = plan.get("affine")
+        if affine is None:
+            affine = (1, 0, 0, 1, plan.get("translate_x", 0), plan.get("translate_y", 0))
+        try:
+            a, b, d, e, xoff, yoff = map(float, affine)
+            finite = all(math.isfinite(v) for v in (a, b, d, e, xoff, yoff))
+            scale = math.hypot(a, d)
+            rotation = math.degrees(math.atan2(d, a))
+            similarity = finite and scale > 0 and abs(a-e) < 1e-9 and abs(b+d) < 1e-9
+            review = (not similarity or abs(scale-1) > AUTO_SCALE_TOLERANCE
+                      or abs(rotation) > AUTO_ROTATION_TOLERANCE_DEGREES)
+        except (ValueError, TypeError):
+            scale, rotation, review, similarity = None, None, True, False
+        fits.append({"plan_id": plan.get("id"), "scale": scale,
+                     "rotation_degrees": rotation, "review_required": review,
+                     "valid_similarity": similarity})
+    return {"per_plan": fits, "review_required": any(f["review_required"] for f in fits),
+            "automatic_scale_tolerance": AUTO_SCALE_TOLERANCE,
+            "automatic_rotation_tolerance_degrees": AUTO_ROTATION_TOLERANCE_DEGREES}
+
 
 @dataclass(frozen=True)
 class PlanSheet:
@@ -357,7 +387,9 @@ def detect(path, *, margin=25.0):
                         continue
                     fit, ordered, reverse, shift = match
                     affine, rms, maximum, scale, rotation = fit
-                    if .8 <= scale <= 1.2 and rms <= 5 and maximum <= 10:
+                    # Discovery only: finding the suspect panels must not let
+                    # ordinary export silently bypass the alignment gate.
+                    if math.isfinite(scale) and scale > 0 and rms <= 5 and maximum <= 10:
                         span = max(item[2] for item in candidate_occurrences) - min(item[2] for item in candidate_occurrences)
                         gps_matches.append((rms, -unique_count, -span, duplicate_count,
                                             candidate_occurrences, ordered, fit, epsg))
@@ -391,9 +423,19 @@ def detect(path, *, margin=25.0):
             affine = (1.0, 0.0, 0.0, 1.0, dx, dy)
             plan_error = control_error
         else:
-            match = _best_similarity(boundary, gps_targets)
-            fit = match[0]
-            affine, plan_error = fit[0], fit[1]
+            # Repeated fingerprints establish translated copies. Freeze the
+            # first control fit: refitting a symmetric outline independently
+            # can choose a 90/180-degree alternative on floating-point noise.
+            base_boundary = occurrences[0][1]
+            base_cx = sum(x for x, _ in base_boundary) / len(base_boundary)
+            base_cy = sum(y for _, y in base_boundary) / len(base_boundary)
+            a, b, d, e, xoff, yoff = first_fit[0]
+            xoff += a * (base_cx-cx) + b * (base_cy-cy)
+            yoff += d * (base_cx-cx) + e * (base_cy-cy)
+            affine = (a, b, d, e, xoff, yoff)
+            errors = [min(math.dist((a*x+b*y+xoff, d*x+e*y+yoff), target)
+                          for target in gps_targets) for x, y in boundary]
+            plan_error = math.sqrt(sum(error**2 for error in errors) / len(errors))
             dx, dy = affine[4], affine[5]
         xmin = min(x for x, _ in boundary) - margin
         ymin = min(y for _, y in boundary) - margin
@@ -424,6 +466,10 @@ def detect(path, *, margin=25.0):
             affine=tuple(affine), sheet_bounds=tuple(frame),
             frame_handle=(str(frame_entity.dxf.handle) if frame_entity is not None else None)))
 
+    fit_diagnostics = alignment_fit_diagnostics([asdict(sheet) for sheet in sheets])
+    if alignment_kind == "gps_similarity":
+        fit_diagnostics.update(scale=first_fit[3], rotation_degrees=first_fit[4],
+                               rms_error_metres=first_fit[1], maximum_error_metres=first_fit[2])
     geographic_controls = [
         (float(item["longitude"]), float(item["latitude"]))
         for item in controls_output if "longitude" in item and "latitude" in item]
@@ -439,7 +485,7 @@ def detect(path, *, margin=25.0):
     if geographic_controls:
         longitudes = [p[0] for p in geographic_controls]
         latitudes = [p[1] for p in geographic_controls]
-        if location_source == "embedded GPS labels":
+        if fit_diagnostics["review_required"] or location_source == "embedded GPS labels":
             # The coordinates are internally consistent, but were not the
             # controls used to fit the repeated boundary in this branch.
             confidence = "review"
@@ -473,11 +519,7 @@ def detect(path, *, margin=25.0):
         "location": location,
         "duplicate_boundary_entities": duplicate_count,
         "drawing_units_code": int(doc.header.get("$INSUNITS", 0) or 0),
-        "fit_diagnostics": ({
-            "scale": first_fit[3], "rotation_degrees": first_fit[4],
-            "maximum_error_metres": first_fit[2],
-            "review_required": abs(first_fit[3] - 1) > 0.001 or abs(first_fit[4]) > 1,
-        } if alignment_kind == "gps_similarity" else {}),
+        "fit_diagnostics": fit_diagnostics,
     }
 
 

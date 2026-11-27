@@ -24,7 +24,7 @@ import semantic_layers
 
 NS = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", NS)
-APP_VERSION = "0.19.0"
+APP_VERSION = "0.22.0"
 APP_AUTHOR = "Dhruv Menaria"
 WGS84_GEOD = Geod(ellps="WGS84")
 
@@ -60,6 +60,7 @@ class Options:
     frozen_plan_detection_json: str = ""
     semantic_manual_rules: tuple = ()
     source_legend_json: str = ""
+    allow_unverified_alignment: bool = False
 
 
 def el(parent, tag, text=None, **attributes):
@@ -262,6 +263,17 @@ def _same_crs(left, right):
         return False
 
 
+def _alignment_review(options, detection):
+    plans = (detection or {}).get('plans') or []
+    selected = [p for p in plans if options.plan_ids is None or p['id'] in options.plan_ids]
+    diagnostics = plan_sheets.alignment_fit_diagnostics(selected)
+    needed = diagnostics['review_required']
+    return {'alignment_warning_required': needed,
+            'unverified_alignment_acknowledged': bool(needed and options.allow_unverified_alignment),
+            'alignment_verification_status': 'unverified' if needed else 'automatic_checks_only',
+            'selected_fit_diagnostics': diagnostics}
+
+
 def _plan_preflight(options):
     """Prevent a repeated paper-plan layout from becoming a plausible but wrong map."""
     if Path(options.input_path).suffix.lower() != ".dxf":
@@ -270,6 +282,19 @@ def _plan_preflight(options):
     if not detection.get("available"):
         return None
     plans = detection.get("plans") or []
+    selected = [p for p in plans if options.plan_ids is None or p["id"] in options.plan_ids]
+    diagnostics = plan_sheets.alignment_fit_diagnostics(selected)
+    if any(not fit['valid_similarity'] for fit in diagnostics['per_plan']):
+        raise ValueError('The plan alignment contains an invalid transform; it cannot be exported.')
+    if diagnostics["review_required"] and not options.allow_unverified_alignment:
+        suspect = next(p for p in diagnostics["per_plan"] if p["review_required"])
+        raise ValueError(
+            f"Automatic plan alignment needs survey review: {suspect['plan_id']} has "
+            f"fitted scale {suspect['scale']} and rotation {suspect['rotation_degrees']} degrees. "
+            "Automatic limits are scale 1 ± 0.001 and rotation ±1 degree. "
+            "Continue using this calculated alignment through the export warning confirmation "
+            "(CLI: --allow-unverified-alignment). The result will be marked unverified. "
+            "A small fit residual does not verify this transform.")
     if options.plan_ids is None:
         raise ValueError(
             f"This drawing contains {len(plans)} repeated side-by-side plan sheets. "
@@ -399,7 +424,10 @@ def make_kml(output_layers, options, report, cancel=None):
     root = ET.Element(f"{{{NS}}}kml")
     doc = el(root, "Document")
     el(doc, "name", options.document_name.strip() or Path(options.input_path).stem)
-    el(doc, "description", f"Converted by MinePlan Earth | {APP_AUTHOR}. Verify survey control points before use.")
+    description = f"Converted by MinePlan Earth | {APP_AUTHOR}. Verify survey control points before use."
+    if (report.get('plan_sheet_alignment') or {}).get('unverified_alignment_acknowledged'):
+        description += ' UNVERIFIED ALIGNMENT: exported with an acknowledged scale/rotation warning.'
+    el(doc, "description", description)
     folders, folder_visibility, plan_folders, styles = {}, {}, {}, {}
     selected_plans = report.get("plan_sheet_alignment", {}).get("selected_plans", [])
     first_plan_name = str(selected_plans[0]["title"]) if selected_plans else None
@@ -612,6 +640,10 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
     try:
         progress(0.01, "Checking drawing layout and survey controls")
         plan_detection = _plan_preflight(options)
+        alignment_review = _alignment_review(options, plan_detection)
+        if alignment_review['unverified_alignment_acknowledged']:
+            quality.add_issue('warning', 'unverified_plan_alignment',
+                              'Export continued with an acknowledged scale/rotation warning. Alignment has not been independently verified.')
         extractor = cad.DXFExtractor(job, quality, token, progress, log)
         records = extractor.extract_all()
         semantic_summary = None
@@ -761,6 +793,7 @@ def convert(options, output_path, *, cancel=None, log=lambda _: None, progress=l
         if plan_detection is not None:
             selected = {value for value in options.plan_ids or ()}
             report["plan_sheet_alignment"] = {
+                **alignment_review,
                 "method": plan_detection["method"],
                 "selected_plans": [p for p in plan_detection["plans"] if p["id"] in selected],
                 "survey_control_points": plan_detection["control_points"],
@@ -842,6 +875,15 @@ def classification_metrics(summary):
         "additional_assignments_for_80_percent": needed_80 if total else None,
         "additional_assignments_for_90_percent": needed_90 if total else None,
         "records_assessed": total,
+        "ai_review_rules_loaded": int(summary.get('ai_review_rules_loaded', 0)),
+        "ai_review_mappings_applied": int(summary.get('ai_review_mappings_applied', 0)),
+        "coverage_before_review_rules": summary.get('coverage_before_review_rules'),
+        "standard_taxonomy_coverage_out_of_100": (
+            round(100 * summary['standard_taxonomy_records'] / total, 2)
+            if total and 'standard_taxonomy_records' in summary else None),
+        "standard_taxonomy_scope": "MinePlan built-in categories; not an approved IBM category mapping.",
+        "ibm_category_mapping_coverage_out_of_100": None,
+        "ibm_category_mapping_status": "not_assessed_approved_taxonomy_not_configured",
         "assigned_without_pending_role_review": complete,
         "unclassified_records": unknown,
         "year_known_feature_role_pending": role_review,
@@ -903,7 +945,7 @@ def submission_groups(detection, selected_ids):
 
 
 def submission_folder_names(input_path):
-    source_name = Path(input_path).stem.strip() or "Mine Plan"
+    source_name = Path(str(input_path).replace('\\', '/')).stem.strip() or "Mine Plan"
     source_name = "".join(
         character if character not in '<>:"/\\|?*' else "-"
         for character in source_name).strip(" .-")
@@ -919,7 +961,7 @@ def convert_submission(options, parent_directory, *, cancel=None,
     if options.plan_ids is None:
         raise ValueError("Enable Plan mode and select the detected plan sheets first.")
     token = cancel or cad.CancellationToken()
-    detection = analyze_plan_sheets(options)
+    detection = _plan_preflight(options) or analyze_plan_sheets(options)
     if not detection.get("available"):
         raise ValueError(detection.get("reason") or "Plan sheets could not be detected.")
     groups = submission_groups(detection, options.plan_ids)
@@ -1036,6 +1078,9 @@ def convert_submission(options, parent_directory, *, cancel=None,
     produced = {item["filename"] for item in files}
     missing = [name for name in GOVERNMENT_FILENAMES if name not in produced]
     warnings = []
+    alignment_review = _alignment_review(options, detection)
+    if alignment_review['unverified_alignment_acknowledged']:
+        warnings.append('Unverified alignment: exported with an acknowledged scale/rotation warning. See per-plate fit diagnostics.')
     if coordinate_control and coordinate_control.get("status") == "review":
         warnings.append(
             "Coordinate-control calibration is at REVIEW status rather than strict PASS; "
@@ -1064,6 +1109,7 @@ def convert_submission(options, parent_directory, *, cancel=None,
         "source_drawing": str(Path(options.input_path).expanduser().resolve()),
         "source_crs": options.source_crs,
         "source_crs_confirmed_by_user": options.location_confirmed,
+        "alignment_review": alignment_review,
         "coordinate_control": coordinate_control,
         "review_required": True,
         "kmz_folder": str(kmz_folder),
@@ -1081,6 +1127,9 @@ def convert_submission(options, parent_directory, *, cancel=None,
         "quality_metrics": classification_metrics({
             "total_records": classified_total, "unclassified_records": unclassified,
             "feature_role_review_records": sum(item.get("semantic_classification", {}).get("feature_role_review_records", 0) for item in files),
+            "standard_taxonomy_records": sum(item.get("semantic_classification", {}).get("standard_taxonomy_records", 0) for item in files),
+            "ai_review_mappings_applied": sum(item.get('semantic_classification', {}).get('ai_review_mappings_applied', 0) for item in files),
+            "ai_review_rules_loaded": max((item.get('semantic_classification', {}).get('ai_review_rules_loaded', 0) for item in files), default=0),
         }),
     }
     manifest = qa_folder / "submission-manifest.json"

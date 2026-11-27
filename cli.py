@@ -20,6 +20,8 @@ def main():
     scope.add_argument("input")
     scope.add_argument("--source-crs", required=True)
     scope.add_argument("--confirm-crs", action="store_true", help="Confirm survey CRS and units")
+    scope.add_argument('--allow-unverified-alignment', action='store_true',
+                       help='Continue with a scale/rotation warning; record the alignment as unverified')
     scope.add_argument("--layer", action="append", help="Repeat for each selected layer")
     scope.add_argument("--altitude", choices=["clampToGround", "absolute", "relativeToGround"], default="clampToGround")
     scope.add_argument("--confirm-heights", action="store_true")
@@ -64,7 +66,7 @@ def main():
                 rotation_degrees=args.rotation, offset_x=args.offset_x, offset_y=args.offset_y,
                 curve_tolerance=args.curve_tolerance, dwg_converter=getattr(args, "dwg_converter", ""),
                 plan_ids=None if args.plan is None else tuple(args.plan),
-                plan_margin=args.plan_margin)
+                plan_margin=args.plan_margin, allow_unverified_alignment=args.allow_unverified_alignment)
             if args.command == "verify":
                 from verifier import format_report, save_report, verify_export
                 if args.report and (Path(args.report).suffix.lower() != ".json" or Path(args.report).exists()):

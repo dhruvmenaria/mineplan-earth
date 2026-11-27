@@ -1119,6 +1119,9 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
     # affect one source object; matching-style rules remain constrained to the
     # reviewed plan and original CAD layer.
     manual_rules = [rule for rule in (manual_rules or ()) if isinstance(rule, dict)]
+    ai_applied = 0
+    complete_before_review = sum(r.get('semantic_category') != 'UNCLASSIFIED - REVIEW'
+                                and not r.get('feature_role_review_required') for r in copied)
     for record in copied:
         # The review window only resolves uncertain objects. Never let a broad
         # style decision replace an explicit layer or legend classification.
@@ -1151,6 +1154,9 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
             "manual_entity_rule" if matching.get("scope") == "entity"
             else "manual_matching_style_rule")
         record["classification_confidence"] = 1.0
+        if matching.get('origin') == 'human_reviewed_ai_proposal':
+            ai_applied += 1
+            record['review_rule_origin'] = 'human_reviewed_ai_proposal'
         record["feature_role_review_required"] = False
         record["cad_layer"] = f"{plan_title} / {category}"
 
@@ -1164,10 +1170,17 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
 
     total = len(copied)
     unclassified = counts.get("UNCLASSIFIED - REVIEW", 0)
+    standard = set(available_categories()) - {"UNCLASSIFIED - REVIEW"}
+    standard_count = sum(r.get('semantic_category') in standard and not r.get('feature_role_review_required')
+                         for r in copied)
     return copied, {
         "total_records": total,
         "classified_records": total - unclassified,
         "unclassified_records": unclassified,
+        "standard_taxonomy_records": standard_count,
+        "nonstandard_or_annotation_records": sum(r.get('semantic_category') not in standard
+                                                 and r.get('semantic_category') != 'UNCLASSIFIED - REVIEW'
+                                                 for r in copied),
         "feature_role_review_records": sum(bool(record.get("feature_role_review_required")) for record in copied),
         "classified_percent": round((total - unclassified) * 100 / total, 2) if total else 0,
         "categories": dict(counts.most_common()),
@@ -1176,6 +1189,9 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
         "plan_style_rules": len(plan_style_map),
         "dominant_style_rules": len(dominant_style_map),
         "manual_rules_loaded": len(manual_rules),
+        "ai_review_rules_loaded": sum(r.get('origin') == 'human_reviewed_ai_proposal' for r in manual_rules),
+        "ai_review_mappings_applied": ai_applied,
+        "coverage_before_review_rules": round(100 * complete_before_review / total, 2) if total else None,
         "allowed_legend_categories": sorted(allowed),
         "classification_policy": (
             "explicit_layers_named_blocks_file_local_legend_constrained_geometry_"

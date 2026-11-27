@@ -118,6 +118,7 @@ def export(options, directory, *, government=False, cancel=None, log=lambda _: N
         detection = converter.analyze_plan_sheets(core_options)
         if detection.get("available") and options.plan_ids is None:
             raise ValueError("Repeated plates detected. Create/analyse the core working DXF first and choose its plan sheets before grouped export.")
+        converter._plan_preflight(replace(core_options, frozen_plan_detection_json=json.dumps(detection)))
         hints, legend = semantic_layers.learn_legend_styles_from_dxf(core, plan_detection=detection)
         frozen = replace(core_options,
             source_legend_json=json.dumps(legend),
@@ -133,6 +134,7 @@ def export(options, directory, *, government=False, cancel=None, log=lambda _: N
             result = converter.convert_submission(frozen, destination, cancel=token,
                                                   log=log, progress=progress)
             manifest = {"source": str(source), "sha256": digest.hexdigest(),
+                        "alignment_review": converter._alignment_review(frozen, detection),
                         "indexed_records": index["records"], "assigned_records": indexed,
                         "counts_by_layer": totals, "bulk_excluded_before_conversion": True,
                         "frozen_settings": asdict(frozen), "package": result["output"],
@@ -170,6 +172,7 @@ def export(options, directory, *, government=False, cancel=None, log=lambda _: N
         with zipfile.ZipFile(master, "w", zipfile.ZIP_DEFLATED) as archive:
             archive.write(combined, "doc.kml")
         manifest = {"source": str(source), "sha256": digest.hexdigest(),
+                    "alignment_review": converter._alignment_review(frozen, detection),
                     "frozen_settings": asdict(frozen), "indexed_records": index["records"],
                     "assigned_records": indexed, "counts_by_layer": totals,
                     "parts": parts, "complete_file": master.name,
