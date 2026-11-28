@@ -428,6 +428,9 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
             graphics.append((entity, box))
 
     observations = []
+    from shapely import STRtree
+    from shapely.geometry import box, Point
+    graphics_tree = STRtree([box(*bounds) for _, bounds in graphics])
     skipped = Counter()
     text_rows = []
     for item in entities:
@@ -438,24 +441,32 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
         height = float(getattr(item.dxf, "char_height", getattr(item.dxf, "height", 1.0)) or 1.0)
         if position is not None:
             text_rows.append((item, value.strip(), position, height))
+    text_tree = STRtree([Point(float(p.x),float(p.y)) for _, _, p, _ in text_rows])
     headings = [(p, h) for _, value, p, h in text_rows
-                if _normalise(value) in {"INDEX", "LEGEND", "GEOLOGICAL INDEX", "GEOLOGICAL LEGEND"}]
+                if _normalise(value) in {"INDEX", "LEGEND", "GEOLOGICAL INDEX", "GEOLOGICAL LEGEND",
+                                         "REFERENCES", "SYMBOLS", "CONVENTIONAL SIGNS", "KEY", "ABBREVIATIONS"}]
     index_regions = []
     for heading, heading_height in headings:
         anchors = [(p, h) for _, value, p, h in text_rows
                    if category_for_text(value) and 4 <= len(value) <= 55
                    and 0 < heading.y - p.y < heading_height * 55
-                   and -heading_height * 2 < p.x - heading.x < heading_height * 18]
+                   and -heading_height * 2 < p.x - heading.x < heading_height * 80]
         if not anchors:
             continue
-        column = max(anchors, key=lambda anchor: sum(
-            abs(p.x - anchor[0].x) < max(h, anchor[1]) * 2 for p, h in anchors))
-        aligned = [(p, h) for p, h in anchors if abs(p.x - column[0].x) < max(h, column[1]) * 2]
-        levels = sorted({p.y for p, _ in aligned})
-        gaps = sorted(b - a for a, b in zip(levels, levels[1:]) if b > a)
-        row_margin = max(column[1] * 3, min(gaps[len(gaps)//2] * 1.25, column[1] * 6) if gaps else 0)
-        index_regions.append((column[0].x, min(p.y for p, _ in aligned) - row_margin,
-                              heading.y, column[1]))
+        columns = []
+        for anchor in sorted(anchors,key=lambda item:item[0].x):
+            if not columns or anchor[0].x-columns[-1][-1][0].x > max(anchor[1],columns[-1][-1][1])*6:
+                columns.append([])
+            columns[-1].append(anchor)
+        for members in columns:
+            column = max(members, key=lambda anchor: sum(
+                abs(p.x - anchor[0].x) < max(h, anchor[1]) * 2 for p, h in members))
+            aligned = [(p, h) for p, h in members if abs(p.x - column[0].x) < max(h, column[1]) * 2]
+            levels = sorted({p.y for p, _ in aligned})
+            gaps = sorted(b - a for a, b in zip(levels, levels[1:]) if b > a)
+            row_margin = max(column[1] * 3, min(gaps[len(gaps)//2] * 1.25, column[1] * 6) if gaps else 0)
+            index_regions.append((column[0].x, min(p.y for p, _ in aligned) - row_margin,
+                                  heading.y, column[1]))
     for label in entities:
         if label.dxftype().upper() not in TEXT_TYPES:
             continue
@@ -488,7 +499,13 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
         maximum_vertical_distance = max(4.0, height * 2.2)
         maximum_sample_size = max(35.0, height * 22.0)
         candidates = []
-        for entity, (xmin, ymin, xmax, ymax) in graphics:
+        nearby_graphics = sorted(int(i) for i in graphics_tree.query(box(
+            insertion.x-maximum_left_distance, insertion.y-maximum_vertical_distance,
+            insertion.x+height, insertion.y+maximum_vertical_distance)))
+        nearby_text = [text_rows[int(i)] for i in text_tree.query(box(
+            insertion.x-height*3,insertion.y-height*6,insertion.x+height*3,insertion.y+height*6))]
+        for graphic_index in nearby_graphics:
+            entity, (xmin, ymin, xmax, ymax) = graphics[graphic_index]
             if xmin == xmax and ymin == ymax and entity.dxftype().upper() == "POINT":
                 pass
             width, box_height = xmax - xmin, ymax - ymin
@@ -504,7 +521,7 @@ def learn_legend_styles_from_document(doc, source_label="loaded drawing", plan_d
             if vertical_gap > maximum_vertical_distance:
                 continue
             # A swatch must belong to this row rather than the next legend row.
-            other_rows = [abs(p.y - centre_y) for item, _, p, _ in text_rows
+            other_rows = [abs(p.y - centre_y) for item, _, p, _ in nearby_text
                           if item is not label and abs(p.x - insertion.x) < height * 3
                           and abs(p.y - insertion.y) > height * 0.6]
             if other_rows and min(other_rows) + height * 0.15 < vertical_gap:
@@ -1119,6 +1136,19 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
     # affect one source object; matching-style rules remain constrained to the
     # reviewed plan and original CAD layer.
     manual_rules = [rule for rule in (manual_rules or ()) if isinstance(rule, dict)]
+    exact_rules = defaultdict(list)
+    style_rules = {}
+    for rule in manual_rules:
+        plan = str(rule.get('plan_id') or '')
+        if rule.get('scope') == 'entity_group':
+            if not isinstance(rule.get('entity_handles'),list) or not all(isinstance(h,str) and h for h in rule['entity_handles']):
+                continue
+            for handle in rule.get('entity_handles') or []:
+                exact_rules[(plan,str(handle))].append(rule)
+        elif rule.get('scope','entity') == 'entity':
+            exact_rules[(plan,str(rule.get('entity_handle') or ''))].append(rule)
+        elif rule.get('scope') == 'style':
+            style_rules[(plan,str(rule.get('original_layer') or ''),tuple(rule.get('signature') or ()))]=rule
     ai_applied = 0
     complete_before_review = sum(r.get('semantic_category') != 'UNCLASSIFIED - REVIEW'
                                 and not r.get('feature_role_review_required') for r in copied)
@@ -1132,17 +1162,16 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
         original_layer = str(record.get("original_cad_layer") or _original_layer(record))
         signature = _style_signature(record)
         matching = None
-        for rule in manual_rules:
-            if str(rule.get("plan_id") or "") != plan_id:
+        for rule in sorted(exact_rules.get((plan_id,handle), ()),key=lambda r:r.get('scope')=='entity_group'):
+            if rule.get('scope') == 'entity_group' and (
+                    tuple(rule.get('signature') or ()) != signature or
+                    str(rule.get('original_layer') or '') != original_layer or
+                    ('source_year' in rule and str(record.get('source_year') or '') != str(rule['source_year']))):
                 continue
-            scope = str(rule.get("scope") or "entity")
-            if scope == "entity" and handle and \
-                    str(rule.get("entity_handle") or "") == handle:
-                matching = rule
-                break
-            if scope == "style" and tuple(rule.get("signature") or ()) == signature and \
-                    str(rule.get("original_layer") or "") == original_layer:
-                matching = rule
+            if handle:
+                matching = rule; break
+        if matching is None:
+            matching = style_rules.get((plan_id,original_layer,signature))
         if matching is None:
             continue
         category = str(matching.get("category") or "").strip()
@@ -1151,7 +1180,8 @@ def classify_records(records, style_hints=None, plan_style_hints=None,
         plan_title = str(record.get("plan_title") or "Plan")
         record["semantic_category"] = category
         record["classification_method"] = (
-            "manual_entity_rule" if matching.get("scope") == "entity"
+            "manual_entity_group_rule" if matching.get('scope') == 'entity_group'
+            else "manual_entity_rule" if matching.get("scope") == "entity"
             else "manual_matching_style_rule")
         record["classification_confidence"] = 1.0
         if matching.get('origin') == 'human_reviewed_ai_proposal':

@@ -372,6 +372,21 @@ def test_detected_frame_does_not_get_claimed_by_a_feature_label():
     assert result[0]["semantic_category"] == "DRAWING FRAME"
 
 
+def test_references_heading_supports_multiple_legend_columns():
+    doc=ezdxf.new(); model=doc.modelspace()
+    model.add_text('REFERENCES',dxfattribs={'insert':(100,110),'height':2})
+    for text,x,y,color in [('CONTOUR',110,90,2),('EXIST. WELL',190,90,5),
+                            ('CRUSHER PLANT',190,80,4),('ROAD/RASTA',190,70,6)]:
+        model.add_text(text,dxfattribs={'insert':(x,y),'height':2})
+        model.add_line((x-10,y),(x-4,y),dxfattribs={'color':color})
+    model.add_text('UNRELATED FEATURE',dxfattribs={'insert':(20,90),'height':2})
+    model.add_line((10,90),(16,90))
+    _,report=semantic_layers.learn_legend_styles_from_document(doc)
+    labels={r['label'] for r in report['observations']}
+    assert {'CONTOUR','EXIST. WELL','CRUSHER PLANT','ROAD/RASTA'}<=labels
+    assert 'UNRELATED FEATURE' not in labels
+
+
 def test_exact_named_tree_survives_incomplete_legend_without_claiming_other_blocks():
     tree = dict(_record("ARC", LineString([(0, 0), (1, 1)])), block_name="TREE")
     other = dict(tree, block_name="TREE_CANDIDATE")

@@ -24,7 +24,7 @@ import semantic_layers
 
 NS = "http://www.opengis.net/kml/2.2"
 ET.register_namespace("", NS)
-APP_VERSION = "0.22.0"
+APP_VERSION = "0.23.0"
 APP_AUTHOR = "Dhruv Menaria"
 WGS84_GEOD = Geod(ellps="WGS84")
 
@@ -148,6 +148,7 @@ def prepare_semantic_review(options, *, cancel=None, log=lambda _: None,
     """Extract and classify source-coordinate records for interactive review."""
     cad.require_runtime()
     job = cad.validate_job(job_for(options), for_writing=False)
+    source_hash = review_rules.source_digest(options.input_path)
     token = cancel or cad.CancellationToken()
     quality = cad.QualityReport(job)
     progress(0.02, "Reading drawing objects")
@@ -216,7 +217,10 @@ def prepare_semantic_review(options, *, cancel=None, log=lambda _: None,
                     if record.get("semantic_category") == "UNCLASSIFIED - REVIEW"
                     or record.get("feature_role_review_required")]
     progress(1.0, "Classification review ready")
+    if review_rules.source_digest(options.input_path) != source_hash:
+        raise ValueError('The drawing changed while preparing review evidence. Analyse the unchanged file again.')
     return {
+        "source_sha256": source_hash,
         "records": records,
         "unclassified": unclassified,
         "summary": semantic_summary,

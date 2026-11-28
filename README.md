@@ -2,6 +2,69 @@
 
 **Dhruv Menaria**
 
+Version 0.23.0 adds bounded grouped AI review and a real accuracy-measurement workflow.
+
+- **Connected groups:** candidates must share plate, original CAD layer, full style
+  and source year, and touch within 0.01 drawing units. At most 40 explicit source
+  objects form a case. Conflicting legend meanings prevent grouping. Polygons,
+  text and disconnected same-style objects remain individual cases. No snapping
+  or geometry editing is performed. Largest groups are reviewed first.
+- **Explicit approval scope:** `C1 ×40` means approval applies to those 40 listed
+  objects, not every same-colour object. Group rules store the explicit handles,
+  style/layer/year guards, evidence-package ID, model/provider where available,
+  explanation and model confidence. They remain tied to the source SHA-256.
+  Existing entity rules still work; direct entity decisions override group decisions.
+- **Evidence:** mining terms such as crusher, weighbridge, magazine, sump, ramp,
+  check dam and forest survive redaction. Unknown names, non-Latin labels and
+  geographic coordinate pairs stay withheld. Crops highlight the target in cyan;
+  that overlay is not a CAD source colour. AI context and legend candidate lookup
+  use plan-local STRtrees. Legends support multiple text columns and additional
+  headings including REFERENCES, SYMBOLS and CONVENTIONAL SIGNS.
+- **AI contract:** requests use category enums, explicit assign/abstain decisions
+  and LOW/MEDIUM/HIGH confidence tiers. Assignments must cite target E0. Claude
+  uses `strict: true`; both provider responses still pass local validation.
+  Abstained, omitted and rejected cases are counted separately. Confidence tiers
+  are model judgements, not measured probabilities; nothing is autoaccepted.
+  Network requests are capped at 20 cases/images; the default remains 12 cases.
+
+Offline preparation on the supplied drawings found 12 cases covering 201 unresolved
+objects for SHIVSHANKAR, 131 for updated, and 56 for mitra mine. These counts
+measure grouping opportunity, not correct AI classifications or future costs.
+Grouped prompts/strict responses are tested with mocked transports; no new live
+model-quality benchmark or paid request was run for this release.
+
+### Independent classification benchmark
+
+Under **More options**, choose **Create accuracy sample**. This creates a random
+sample of up to 100 extracted records, PNG target previews, a private JSON
+manifest and a `.labels.csv` template. An independent mining reviewer fills
+`reference_category` and `verified_by` in the CSV after checking the source/legend.
+No reference category is prefilled from an AI suggestion or saved approval.
+Use canonical `category_choices` in the JSON where appropriate. Keep the sample
+files private; this workflow does not upload them.
+
+Choose **Score verified sample** to compare fresh predictions. It reports accuracy,
+precision among assignments, abstentions, per-category precision/recall and
+reference completeness. Unlabelled samples produce **not measured**, not 100%.
+Samples with saved review rules are flagged as human-assisted. Source-hash or
+object-identity mismatches fail rather than silently reusing stale references.
+
+For a declared drawing holdout, use the CLI and list every drawing used to tune
+or train rules/models. Split by whole drawing/source hash, not random entities:
+
+```powershell
+.\.venv\Scripts\python.exe cli.py benchmark-sample "C:\Plans\new.dxf" output\reference.json --count 100
+# Independently fill output\reference.labels.csv, then:
+.\.venv\Scripts\python.exe cli.py benchmark-score output\reference.json output\accuracy.json --training-source "C:\Plans\training.dxf"
+```
+
+No independently verified mining reference labels have been supplied yet, so no
+new real-world accuracy percentage is claimed. The benchmark measures sampled
+classification only, not georeferencing accuracy or regulatory approval. Broad
+style promotion, automatic acceptance from model agreement, automatic boundary
+repair, and learned local classifiers are not enabled. Right-side swatches and
+multi-colour composite-symbol inference still need representative test drawings.
+
 Version 0.22.0 simplifies AI review into one guided window:
 
 1. Click **AI review & export** on the main screen, enter a provider/key and **Ask AI**.

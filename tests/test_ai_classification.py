@@ -76,13 +76,15 @@ def test_mock_claude_response_is_validated_without_executing_tools(tmp_path,monk
         def read(self,*args):
             return json.dumps({"stop_reason":"tool_use","content":[{
                 "type":"tool_use","name":"submit_classifications",
-                "input":{"assignments":[proposal()]}}],
+                "input":{"assignments":[dict(proposal(),decision='assign',confidence='HIGH',evidence_ids=['E0','E1'])]}}],
                 "usage":{"input_tokens":100,"output_tokens":20}}).encode()
     def transport(request,**kwargs):
         assert request.full_url == "https://api.anthropic.com/v1/messages"
         body = json.loads(request.data)
         assert body["model"] == "configured-model"
         assert body["tools"][0]["name"] == "submit_classifications"
+        assert body['tools'][0]['strict'] is True
+        assert 'ABSTAIN' in body['tools'][0]['input_schema']['properties']['assignments']['items']['properties']['category']['enum']
         assert "test-key" not in json.dumps(body)
         assert 'entity_handle' not in json.dumps(body['messages'])
         assert 'source_sha256' not in json.dumps(body['messages'])
@@ -139,7 +141,7 @@ def test_compact_redaction_removes_names_gps_world_bounds_and_private_mappings(t
 def gemini_reply(assignments=None, finish='STOP'):
     return {'modelVersion':'gemini-2.5-flash','candidates':[{'finishReason':finish,
             'content':{'parts':[{'functionCall':{'name':'submit_classifications',
-                        'args':{'assignments':[proposal()] if assignments is None else assignments}}}]}}],
+                        'args':{'assignments':[dict(proposal(),decision='assign',confidence='HIGH',evidence_ids=['E0','E1'])] if assignments is None else assignments}}}]}}],
             'usageMetadata':{'promptTokenCount':123,'candidatesTokenCount':45,'totalTokenCount':168}}
 
 

@@ -151,6 +151,7 @@ def test_acknowledgement_does_not_bypass_invalid_matrix_or_wrong_crs(tmp_path):
 
 def test_desktop_warning_yes_continues_and_no_cancels(tmp_path,monkeypatch):
     from types import SimpleNamespace
+    pytest.importorskip('tkinter',reason='Desktop UI check requires tkinter; backend tests remain available without it.')
     import app
     source=drawing(tmp_path,1.15,0)
     detection=plan_sheets.detect(source)

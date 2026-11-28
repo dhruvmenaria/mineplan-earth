@@ -93,7 +93,7 @@ def save_rules(path, rules, directory=None, source_sha256=None):
 def add_rule(path, rule, directory=None):
     document = load_document(path, directory)
     rules = document.get("rules", [])
-    identity_fields = ("scope", "plan_id", "entity_handle", "signature", "original_layer")
+    identity_fields = ("scope", "plan_id", "entity_handle", "entity_handles", "signature", "original_layer")
     identity = tuple(json.dumps(rule.get(field), sort_keys=True) for field in identity_fields)
     kept = []
     for existing in rules:

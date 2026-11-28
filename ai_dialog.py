@@ -29,6 +29,7 @@ def _window(app, options, package, review):
     body.rowconfigure(4, weight=1)
     body.rowconfigure(5, weight=2)
     state = ai.ProposalReview()
+    provenance = {}
     seen = set()
     has_result = False
     poll_job = None
@@ -37,6 +38,7 @@ def _window(app, options, package, review):
                                if provider.get() == 'Gemini' else os.environ.get('MINEPLAN_CLAUDE_MODEL', '')))
     key = tk.StringVar(value='')
     redact = tk.BooleanVar(value=package.get('redaction_enabled', True))
+    grouped = tk.BooleanVar(value=package.get('grouping_enabled', True))
     advanced = tk.BooleanVar(value=False)
     status = tk.StringVar()
     usage = tk.StringVar(value='No API request made. Only a bounded batch is sent each time.')
@@ -105,28 +107,34 @@ def _window(app, options, package, review):
     extras = ttk.Frame(body)
     extras.grid(row=8, column=0, sticky='ew')
     extras.grid_remove()
-    ttk.Checkbutton(extras, text='Redact name/location labels', variable=redact, command=lambda: rebuild()).pack(side='left')
-    ttk.Button(extras, text='Inspect outbound', command=lambda: inspect()).pack(side='left', padx=3)
-    ttk.Button(extras, text='Save evidence', command=lambda: export_evidence()).pack(side='left', padx=3)
-    ttk.Button(extras, text='Import reply', command=lambda: import_reply()).pack(side='left', padx=3)
-    ttk.Button(extras, text='Manual categories', command=lambda: manual()).pack(side='left', padx=3)
-    save_only_button = ttk.Button(extras, text='Save only', command=lambda: save('only'))
+    privacy_tools=ttk.Frame(extras); privacy_tools.pack(fill='x')
+    data_tools=ttk.Frame(extras); data_tools.pack(fill='x',pady=3)
+    save_tools=ttk.Frame(extras); save_tools.pack(fill='x')
+    ttk.Checkbutton(privacy_tools, text='Redact name/location labels', variable=redact, command=lambda: rebuild()).pack(side='left')
+    ttk.Checkbutton(privacy_tools, text='Group connected objects (max 40)', variable=grouped, command=lambda: rebuild()).pack(side='left')
+    ttk.Button(data_tools, text='Inspect outbound', command=lambda: inspect()).pack(side='left', padx=3)
+    ttk.Button(data_tools, text='Save evidence', command=lambda: export_evidence()).pack(side='left', padx=3)
+    ttk.Button(data_tools, text='Import reply', command=lambda: import_reply()).pack(side='left', padx=3)
+    ttk.Button(data_tools, text='Manual categories', command=lambda: manual()).pack(side='left', padx=3)
+    ttk.Button(data_tools, text='Create accuracy sample', command=lambda: benchmark_sample()).pack(side='left',padx=3)
+    ttk.Button(data_tools, text='Score verified sample', command=lambda: benchmark_score()).pack(side='left',padx=3)
+    save_only_button = ttk.Button(save_tools, text='Save only', command=lambda: save('only'))
     save_only_button.pack(side='left', padx=3)
-    next_button = ttk.Button(extras, text='Save & next batch', command=lambda: save('next'))
+    next_button = ttk.Button(save_tools, text='Save & next batch', command=lambda: save('next'))
     next_button.pack(side='left', padx=3)
-    ttk.Button(extras, text='Skip batch', command=lambda: skip_batch()).pack(side='left', padx=3)
+    ttk.Button(save_tools, text='Skip batch', command=lambda: skip_batch()).pack(side='left', padx=3)
 
     def prepared_status():
         coverage = converter.classification_metrics(review['summary']).get('classification_coverage_out_of_100')
         score = f'{coverage:.2f}%' if coverage is not None else 'not assessed'
         applied = converter.classification_metrics(review['summary'])['ai_review_mappings_applied']
         status.set(f'Current coverage: {score}. {applied} AI-reviewed mappings applied. {len(review["unclassified"]):,} objects unresolved. '
-                   f'{len(package["cases"])} prepared for this batch; nothing sent yet.')
+                   f'{len(package["cases"])} cases covering {package.get("objects_in_batch",len(package["cases"]))} objects prepared; nothing sent.')
         if not has_result:
             titles = {str(r.get('plan_id') or ''): r.get('plan_title') or 'Drawing' for r in review['records']}
             tree.delete(*tree.get_children())
             for case in package['cases']:
-                tree.insert('', 'end', iid=case['case_id'], values=('—', case['case_id'], 'Not sent to AI yet', titles.get(case['plan_id'], 'Drawing')))
+                tree.insert('', 'end', iid=case['case_id'], values=('—', f"{case['case_id']} ×{case.get('member_count',1)}", 'Not sent to AI yet', titles.get(case['plan_id'], 'Drawing')))
             if package['cases']:
                 tree.selection_set(package['cases'][0]['case_id']); select()
 
@@ -170,7 +178,11 @@ def _window(app, options, package, review):
         label = ai.category_label(package, proposal['category']) if proposal else 'prepared locally — nothing sent'
         selection_title.set(f"{case['case_id']}: {label}")
         refs = [e for e in case['evidence'] if not proposal or e['evidence_id'] in proposal['evidence_ids']]
-        explanation = (proposal['explanation'] if proposal else 'AI has not reviewed this object. It is still unresolved.') + '\n\nSupporting evidence:\n'
+        explanation = f"This decision covers {case.get('member_count',1)} explicit object(s) in this plate. Mixed meanings must be skipped or reviewed individually.\n\n"
+        explanation += (proposal['explanation'] if proposal else 'AI has not reviewed this object. It is still unresolved.')
+        if proposal:
+            explanation += f"\nModel confidence: {proposal.get('confidence','not supplied')} (not verified accuracy)."
+        explanation += '\n\nSupporting evidence:\n'
         for row in refs:
             explanation += f"• {row['evidence_id']}: {row.get('text_value') or row.get('block_name') or row.get('entity_type', 'drawing object')}"
             if row.get('color_hex'):
@@ -206,17 +218,20 @@ def _window(app, options, package, review):
         if not dialog.winfo_exists():
             return
         state.load(result.get('assignments', []))
+        provenance.clear()
+        provenance.update(provider=result.get('provider','Imported AI'), model=result.get('reported_model') or result.get('model',''))
         has_result = True
-        seen.update((c['plan_id'], c['entity_handle']) for c in package['cases'])
+        seen.update((c['plan_id'], h) for c in package['cases'] for h in c.get('_members',[c['entity_handle']]))
         tree.delete(*tree.get_children())
         titles = {str(r.get('plan_id') or ''): r.get('plan_title') or 'Drawing' for r in review['records']}
         for proposal in state.proposals:
             cid = proposal['case_id']
-            tree.insert('', 'end', iid=cid, values=('☐', cid, ai.category_label(package, proposal['category']),
+            case = next(c for c in package['cases'] if c['case_id']==cid)
+            tree.insert('', 'end', iid=cid, values=('☐', f"{cid} ×{case.get('member_count',1)}", ai.category_label(package, proposal['category']),
                                                     titles.get(proposal['plan_id'], 'Drawing')))
         render_checks()
         usage.set(f"{result.get('provider', 'Imported AI')} / {result.get('reported_model') or result.get('model', '')}. "
-                  f"Usage: {result.get('usage', {})}. {len(result.get('rejected', []))} responses rejected by validation.")
+                  f"Usage: {result.get('usage', {})}. Abstained: {len(result.get('abstentions',[]))}; omitted: {len(result.get('omitted_case_ids',[]))}; rejected: {len(result.get('rejected', []))}.")
         if state.proposals:
             first = state.proposals[0]['case_id']
             tree.selection_set(first); tree.focus(first); select()
@@ -267,7 +282,7 @@ def _window(app, options, package, review):
         nonlocal has_result
         review.clear(); review.update(fresh)
         eligible = [r for r in fresh['unclassified'] if (str(r.get('plan_id') or ''), str(r.get('entity_handle') or '')) not in seen]
-        package.clear(); package.update(ai.build_package(options.input_path, dict(fresh, unclassified=eligible), redact=redact.get()))
+        package.clear(); package.update(ai.build_package(options.input_path, dict(fresh, unclassified=eligible), redact=redact.get(),grouped=grouped.get()))
         has_result = False; state.load([]); tree.delete(*tree.get_children()); canvas.delete('all')
         detail.configure(state='normal'); detail.delete('1.0', 'end'); detail.configure(state='disabled')
         prepared_status()
@@ -275,7 +290,7 @@ def _window(app, options, package, review):
     def skip_batch():
         if app.busy:
             return
-        seen.update((c['plan_id'], c['entity_handle']) for c in package['cases'])
+        seen.update((c['plan_id'], h) for c in package['cases'] for h in c.get('_members',[c['entity_handle']]))
         prepare_next(dict(review))
 
     def save(action):
@@ -286,12 +301,13 @@ def _window(app, options, package, review):
             messagebox.showinfo('Review suggestions', 'Tick Reviewed beside the suggestions you have checked first.', parent=dialog)
             return
         try:
-            ai.apply_reviewed(options.input_path, package, picked)
+            ai.apply_reviewed(options.input_path, package, picked,provenance=provenance)
         except (ValueError, OSError) as exc:
             messagebox.showerror('Save mappings', str(exc), parent=dialog)
             return
         state.mark_saved(picked); render_checks()
-        status.set(f'Saved {len(picked)} reviewed mappings. Refreshing coverage…')
+        count = sum(c.get('member_count',1) for c in package['cases'] if c['case_id'] in {p['case_id'] for p in picked})
+        status.set(f'Saved {len(picked)} reviewed decisions covering {count} objects. Refreshing coverage…')
         def refreshed(fresh):
             metrics = converter.classification_metrics(fresh['summary'])
             coverage = metrics.get('classification_coverage_out_of_100')
@@ -333,7 +349,7 @@ def _window(app, options, package, review):
         if path:
             payload = {'evidence_package_id':ai.package_id(package), 'package':ai.public_package(package),
                        'response_format':{'evidence_package_id':ai.package_id(package), 'assignments':[]},
-                       'instructions':ai.SYSTEM, 'response_schema':ai.SCHEMA}
+                       'instructions':ai.SYSTEM, 'response_schema':ai.proposal_schema(package)}
             converter._atomic_bytes(path, json.dumps(payload, indent=2).encode())
 
     def import_reply():
@@ -356,6 +372,45 @@ def _window(app, options, package, review):
             return
         close(notify=False)
         app._open_review_dialog(review, options)
+
+    def benchmark_sample():
+        if app.busy:
+            return
+        path=filedialog.asksaveasfilename(parent=dialog,title='Create local accuracy reference sample',
+                 initialfile=Path(options.input_path).stem+'-accuracy-sample.json',defaultextension='.json',
+                 filetypes=[('JSON reference manifest','*.json')])
+        if not path:
+            return
+        import classification_benchmark as benchmark
+        def ready(document):
+            status.set(f"Created {len(document['samples'])} local cases. Ask an independent reviewer to fill {document['labels_csv']}. No accuracy is claimed yet.")
+        app._run(lambda token,log,progress: benchmark.create_sample(options.input_path,review,path),ready)
+
+    def benchmark_score():
+        if app.busy:
+            return
+        sample=filedialog.askopenfilename(parent=dialog,title='Choose verified sample JSON (labels CSV is read alongside it)',
+                                         filetypes=[('JSON reference manifest','*.json')])
+        if not sample:
+            return
+        output=filedialog.asksaveasfilename(parent=dialog,title='Save accuracy report',defaultextension='.json',
+                                            initialfile='classification-accuracy-report.json')
+        if not output:
+            return
+        if Path(output).exists():
+            messagebox.showerror('Accuracy report','Choose a new report filename.',parent=dialog); return
+        def work(token,log,progress):
+            import classification_benchmark as benchmark
+            document=json.loads(Path(sample).read_text(encoding='utf-8'))
+            fresh=converter.prepare_semantic_review(options,cancel=token,log=log,progress=progress)
+            result=benchmark.evaluate(options.input_path,document,fresh)
+            converter._atomic_bytes(output,json.dumps(result,indent=2).encode())
+            return result
+        def ready(result):
+            accuracy = 'not measured — independent labels needed' if result['accuracy_percent'] is None else f"{result['accuracy_percent']}%"
+            status.set(f"Verified labels: {result['verified_reference_records']}/{result['sample_records']}. "
+                       f"Accuracy on those labels: {accuracy}. Holdout: {result['holdout_status']}. Report: {output}")
+        app._run(work,ready)
 
     # Local UI smoke checks can exercise display/review without a paid request.
     dialog._mineplan_ai = {'display':display, 'state':state, 'tree':tree, 'canvas':canvas,

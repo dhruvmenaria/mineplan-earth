@@ -16,6 +16,12 @@ def main():
     plans = commands.add_parser("plans", help="Detect side-by-side plan sheets and survey controls")
     plans.add_argument("input")
     plans.add_argument("--plan-margin", type=float, default=25)
+    benchmark=commands.add_parser('benchmark-sample',help='Create local random samples with blank independent reference labels')
+    benchmark.add_argument('input'); benchmark.add_argument('output')
+    benchmark.add_argument('--count',type=int,default=100); benchmark.add_argument('--seed',type=int,default=17)
+    score=commands.add_parser('benchmark-score',help='Evaluate independently verified sample labels; never calls AI')
+    score.add_argument('sample'); score.add_argument('output')
+    score.add_argument('--training-source',action='append',default=[],help='Repeat for every drawing used to tune/train the classifier')
     scope = argparse.ArgumentParser(add_help=False)
     scope.add_argument("input")
     scope.add_argument("--source-crs", required=True)
@@ -55,6 +61,25 @@ def main():
             result = converter.analyze_plan_sheets(
                 converter.Options(args.input, plan_margin=args.plan_margin))
             print(json.dumps(result, indent=2, default=str))
+        elif args.command in {'benchmark-sample','benchmark-score'}:
+            from dataclasses import replace
+            import classification_benchmark as benchmark
+            reference = json.loads(Path(args.sample).read_text(encoding='utf-8')) if args.command=='benchmark-score' else None
+            source = reference['source_path'] if reference else args.input
+            options=converter.Options(source)
+            detection=converter.analyze_plan_sheets(options)
+            if detection.get('available'):
+                options=replace(options,plan_ids=tuple(p['id'] for p in detection['plans']),frozen_plan_detection_json=json.dumps(detection))
+            review=converter.prepare_semantic_review(options)
+            if args.command=='benchmark-sample':
+                result=benchmark.create_sample(source,review,args.output,count=args.count,seed=args.seed)
+                print(f"Prepared {len(result['samples'])} local reference cases. Labels are blank; no accuracy is claimed.")
+            else:
+                if Path(args.output).exists():
+                    raise ValueError('Choose a new report filename.')
+                result=benchmark.evaluate(source,reference,review,training_sources=args.training_source)
+                converter._atomic_bytes(args.output,json.dumps(result,indent=2).encode())
+                print(json.dumps(result,indent=2))
         else:
             if args.command == "convert" and Path(args.output).exists() and not args.overwrite:
                 parser.error("Output exists. Choose another path or pass --overwrite.")
